@@ -22,6 +22,7 @@ const CONTRACTS = [
   "FeeCollector",
   "AmmV3Venue",
   "LiquidityLocker",
+  "PoolRouter",
 ];
 
 const deployment = JSON.parse(fs.readFileSync(path.join(root, "deployments", `${network}.json`), "utf8"));

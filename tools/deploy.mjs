@@ -8,6 +8,7 @@
 // about them. Each wiring call can be made exactly once.
 //
 //   NETWORK=sepolia RPC_URL=... PRIVATE_KEY=... node tools/deploy.mjs
+//   NETWORK=sepolia ADD=PoolRouter RPC_URL=... PRIVATE_KEY=... node tools/deploy.mjs   # add to an existing deployment
 //
 // A known NETWORK supplies the AMM's addresses; any other network needs
 // POSITION_MANAGER and WRAPPED_NATIVE. TREASURY and ADMIN default to the
@@ -85,6 +86,7 @@ const plan = [
   "FeeCollector(factory, locker, escrow, vault)",
   "LaunchRouter(factory)",
   "LaunchLens(factory)",
+  "PoolRouter(positionManager, wrappedNative)",
   "factory.wire(launchDeployer, feeCollector)",
   "vault.setFactory(factory)",
   "locker.setFactory(factory)",
@@ -126,6 +128,7 @@ async function fees() {
   return { maxPriorityFeePerGas: tip, maxFeePerGas: block.baseFeePerGas * 3n + tip };
 }
 
+const recordFile = path.join(root, "deployments", `${networkName}.json`);
 const record = {
   network: networkName,
   chainId,
@@ -137,7 +140,6 @@ const record = {
   contracts: {},
   configs: [],
 };
-const recordFile = path.join(root, "deployments", `${networkName}.json`);
 
 function save() {
   fs.mkdirSync(path.dirname(recordFile), { recursive: true });
@@ -171,6 +173,21 @@ async function call(contract, fn, args, label = fn) {
   return receipt;
 }
 
+// ADD=PoolRouter deploys only the stateless contracts that need nothing but
+// the AMM, and appends them to an existing deployment record.
+const ADDABLE = { PoolRouter: () => [config.positionManager, config.wrappedNative] };
+if (process.env.ADD) {
+  const existing = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+  if (existing.chainId !== chainId) throw new Error(`${recordFile} is for chain ${existing.chainId}`);
+  Object.assign(record, existing);
+  for (const name of process.env.ADD.split(",")) {
+    if (!ADDABLE[name]) throw new Error(`ADD supports ${Object.keys(ADDABLE).join(", ")}`);
+    await deploy(name, ADDABLE[name]());
+  }
+  console.log(`\nrecorded in ${path.relative(root, recordFile)}`);
+  process.exit(0);
+}
+
 console.log(`network ${networkName} (chain ${chainId})`);
 console.log(`deploying as ${wallet.address}, admin ${config.admin}, treasury ${config.treasury}\n`);
 
@@ -200,6 +217,7 @@ const collector = await deploy("FeeCollector", [
 ]);
 const router = await deploy("LaunchRouter", [factoryAddress]);
 await deploy("LaunchLens", [factoryAddress]);
+await deploy("PoolRouter", [config.positionManager, config.wrappedNative]);
 
 console.log("\nwiring");
 await call(factory, "wire", [await launchDeployer.getAddress(), await collector.getAddress()]);

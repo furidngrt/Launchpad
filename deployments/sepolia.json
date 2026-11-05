@@ -78,6 +78,14 @@
       "transaction": "0x8cfec55b36deae97334e6099e3ab0b595319e4c97170aec74a199770864e988d",
       "block": 12067559,
       "gasUsed": "4868262"
+    },
+    "PoolRouter": {
+      "address": "0xc856Ad88782a843EFe2d552c7d092c34d1a35428",
+      "source": "src/PoolRouter.sol:PoolRouter",
+      "constructorArgs": "0x0000000000000000000000001238536071e1c677a632429e3655c799b22cda52000000000000000000000000fff9976782d46cc05630d1f6ebab18b2324d6b14",
+      "transaction": "0x045404171e91774941f21a822c2b76c3290a8e8e0580924830c0b7299e89fbab",
+      "block": 12067865,
+      "gasUsed": "6468793"
     }
   },
   "configs": [

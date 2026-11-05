@@ -1255,6 +1255,82 @@ test("invariants: random trading keeps every curve solvent and every quote exact
   }
 });
 
+test("pool router: buys and sells a graduated launch in native value, exactly as quoted", async () => {
+  const env = await deployProtocol();
+  const { c, weth, positions } = env;
+  const { token, curve } = await createLaunch(env);
+  const router = await c.deploy("PoolRouter", [positions.address, weth.address], { from: ADMIN });
+  const FEE = CONFIG.venueFee;
+  const DEADLINE = 2n ** 40n;
+
+  // Before graduation there is no pool to trade in.
+  await c.expectRevert(c.send(router, "buy", [token.address, FEE, 0, OTHER, DEADLINE], { from: OTHER, value: E(1) }), "NoPool");
+
+  await buyOutCurve(env, curve);
+  const pool = await c.call(router, "poolFor", [token.address, FEE]);
+  assertEqual(pool, await c.call(env.venue, "poolFor", [token.address, ZERO, FEE]), "same pool as the listing");
+
+  // Buy: the quote is exact, the tokens land with the recipient, and the
+  // router keeps nothing.
+  const [quotedOut, quotedPrice] = await c.call(router, "quoteBuy", [token.address, FEE, E(1)]);
+  assert(quotedOut > 0n, "quote returns tokens");
+  const ethBefore = await c.balanceOf(OTHER);
+  const { logs } = await c.send(router, "buy", [token.address, FEE, quotedOut, OTHER, DEADLINE], { from: OTHER, value: E(1) });
+  const [swap] = c.eventsFrom(logs, "PoolRouter", "Swap");
+  assertEqual(swap.amountOut, quotedOut, "buy settles at the quote");
+  assertEqual(swap.sqrtPriceAfter, quotedPrice, "price after matches the quote");
+  assertEqual(swap.isBuy, true, "flagged as a buy");
+  assertEqual(await c.call(token, "balanceOf", [OTHER]), quotedOut, "tokens delivered");
+  assertEqual(ethBefore - (await c.balanceOf(OTHER)), E(1), "exactly the value sent was spent");
+  assertEqual(await c.balanceOf(router.address), 0n, "router holds no native value");
+  assertEqual(await c.call(weth, "balanceOf", [router.address]), 0n, "router holds no wrapped value");
+
+  // Sell half back: only the amount sold is drawn, and native value is paid.
+  const half = quotedOut / 2n;
+  await c.send(token, "approve", [router.address, half], { from: OTHER });
+  const [quotedEth] = await c.call(router, "quoteSell", [token.address, FEE, half]);
+  await c.expectRevert(
+    c.send(router, "sell", [token.address, FEE, half, quotedEth + 1n, OTHER, DEADLINE], { from: OTHER }),
+    "SlippageExceeded",
+  );
+  const before = await c.balanceOf(OTHER);
+  const sold = await c.send(router, "sell", [token.address, FEE, half, quotedEth, OTHER, DEADLINE], { from: OTHER });
+  const [sale] = c.eventsFrom(sold.logs, "PoolRouter", "Swap");
+  assertEqual(sale.amountOut, quotedEth, "sale settles at the quote");
+  assertEqual((await c.balanceOf(OTHER)) - before, quotedEth, "native value paid");
+  assertEqual(await c.call(token, "balanceOf", [OTHER]), quotedOut - half, "only the sold amount left");
+  assertEqual(await c.call(token, "allowance", [OTHER, router.address]), 0n, "allowance used exactly");
+  assertEqual(await c.call(token, "balanceOf", [router.address]), 0n, "router holds no tokens");
+  // Selling part of a position back cannot return more than was paid for all of it.
+  assert(quotedEth > 0n && quotedEth < E(1), "sale bounded by the purchase");
+});
+
+test("pool router: rejects stale, underpriced and unsolicited calls", async () => {
+  const env = await deployProtocol();
+  const { c, weth, positions } = env;
+  const { token, curve } = await createLaunch(env);
+  const router = await c.deploy("PoolRouter", [positions.address, weth.address], { from: ADMIN });
+  const FEE = CONFIG.venueFee;
+  await buyOutCurve(env, curve);
+
+  const [quoted] = await c.call(router, "quoteBuy", [token.address, FEE, E(1)]);
+  await c.expectRevert(
+    c.send(router, "buy", [token.address, FEE, quoted + 1n, OTHER, 2n ** 40n], { from: OTHER, value: E(1) }),
+    "SlippageExceeded",
+  );
+  await c.expectRevert(c.send(router, "buy", [token.address, FEE, 0, OTHER, 0], { from: OTHER, value: E(1) }), "Expired");
+  await c.expectRevert(c.send(router, "buy", [token.address, 3000, 0, OTHER, 2n ** 40n], { from: OTHER, value: E(1) }), "NoPool");
+
+  // Nobody but the pool mid-swap can draw on the router, and it accepts
+  // native value only from unwrapping.
+  await c.expectRevert(c.send(router, "uniswapV3SwapCallback", [1, 1, "0x" + "00".repeat(32)], { from: OTHER }), "UnexpectedCallback");
+  const pool = await c.call(router, "poolFor", [token.address, FEE]);
+  await c.expectRevert(
+    c.send(router, "uniswapV3SwapCallback", [1, 1, "0x" + "00".repeat(32)], { from: pool }),
+    "UnexpectedCallback",
+  );
+});
+
 // --- Runner -----------------------------------------------------------------
 
 let passed = 0;

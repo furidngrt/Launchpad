@@ -1,18 +1,19 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
-import { LaunchRow, LaunchTile, TopCard } from "../components/LaunchCard";
-import { EmptyState, InfoDot, Skeleton } from "../components/ui";
+import { LaunchCard, LaunchRow, SpotlightCard } from "../components/LaunchCard";
+import { EmptyState, Skeleton } from "../components/ui";
 import { chain } from "../config/wagmi";
 import { PHASE, useLaunchTimes, useLaunches, type LaunchSummary } from "../lib/data";
+import { formatEth } from "../lib/format";
 
 type Tab = "top" | "new" | "near" | "graduated";
 type View = "grid" | "list";
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "top", label: "Top", icon: "M4 20V10M10 20V4M16 20v-7M22 20H2" },
+  { id: "top", label: "Trending", icon: "M4 20V10M10 20V4M16 20v-7M22 20H2" },
   { id: "new", label: "New", icon: "M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6" },
-  { id: "near", label: "Near graduation", icon: "M3 17l6-6 4 4 8-8M15 7h6v6" },
+  { id: "near", label: "About to graduate", icon: "M3 17l6-6 4 4 8-8M15 7h6v6" },
   { id: "graduated", label: "Graduated", icon: "M5 12.5 10 17l9-10" },
 ];
 
@@ -30,7 +31,6 @@ export function Explore() {
   const [params] = useSearchParams();
   const [tab, setTab] = useState<Tab>("top");
   const [view, setView] = useState<View>(readView);
-  const strip = useRef<HTMLDivElement>(null);
   const query = (params.get("q") ?? "").trim().toLowerCase();
 
   const created = (l: LaunchSummary) => times?.get(l.address.toLowerCase());
@@ -41,7 +41,23 @@ export function Explore() {
     return list.filter((l) => l.name.toLowerCase().includes(query) || l.symbol.toLowerCase().includes(query) || l.address.toLowerCase() === query);
   }, [data, query]);
 
-  const top = useMemo(() => [...(data?.launches ?? [])].sort(byMarketCap).slice(0, 10), [data]);
+  const spotlight = useMemo(() => {
+    const list = data?.launches ?? [];
+    // Prefer the most valuable launch still on its curve, where there is
+    // something left to watch; fall back to the most valuable overall.
+    const live = list.filter((l) => l.record.phase === PHASE.Curve).sort(byMarketCap);
+    return live[0] ?? [...list].sort(byMarketCap)[0];
+  }, [data]);
+
+  const stats = useMemo(() => {
+    const list = data?.launches ?? [];
+    return {
+      total: data?.count ?? 0,
+      live: list.filter((l) => l.record.phase === PHASE.Curve).length,
+      graduated: list.filter((l) => l.record.phase === PHASE.Listed).length,
+      raised: list.reduce((sum, l) => sum + l.raised, 0n),
+    };
+  }, [data]);
 
   const shown = useMemo(() => {
     const list = [...all];
@@ -62,56 +78,71 @@ export function Explore() {
 
   return (
     <div className="explore">
-      <section className="container intro">
-        <div className="intro-copy">
-          <h1>
-            Launch and trade fair-launch tokens on <span className="chain-chip"><span className="status-dot live" aria-hidden />{chain.name}</span>
-          </h1>
-          <p className="muted">A bonding curve first, a permanently locked Uniswap pool after. No pre-mine, no owner, nothing to pull.</p>
-        </div>
-        <Link to="/create" className="btn btn-primary only-mobile">
-          Launch a token
-        </Link>
-      </section>
-
       {!query && (
-        <section className="container block">
-          <div className="block-head">
-            <h2>
-              Top tokens <InfoDot title="Ranked by market cap" />
-            </h2>
-            <div className="strip-nav">
-              <button className="icon-button" aria-label="Scroll left" onClick={() => strip.current?.scrollBy({ left: -320, behavior: "smooth" })}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <path d="M15 6l-6 6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-              <button className="icon-button" aria-label="Scroll right" onClick={() => strip.current?.scrollBy({ left: 320, behavior: "smooth" })}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <path d="M9 6l6 6-6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
+        <section className="container hero">
+          <div className="hero-copy">
+            <span className="eyebrow">
+              <span className="status-dot live" aria-hidden />
+              Live on {chain.name}
+            </span>
+            <h1>Fair launches that graduate into liquidity nobody can pull.</h1>
+            <p className="muted">
+              Every token starts on a bonding curve with its whole supply. When the curve fills, it moves into a pool whose liquidity is
+              locked forever, and you keep trading it right here.
+            </p>
+            <div className="hero-actions">
+              <Link to="/create" className="btn btn-primary">
+                Launch a token
+              </Link>
+              <Link to="/how-it-works" className="btn btn-secondary">
+                How it works
+              </Link>
             </div>
+            <dl className="hero-stats">
+              <div>
+                <dt>Launches</dt>
+                <dd>{isLoading ? "—" : stats.total}</dd>
+              </div>
+              <div>
+                <dt>On the curve</dt>
+                <dd>{isLoading ? "—" : stats.live}</dd>
+              </div>
+              <div>
+                <dt>Graduated</dt>
+                <dd>{isLoading ? "—" : stats.graduated}</dd>
+              </div>
+              <div>
+                <dt>Raised</dt>
+                <dd>{isLoading ? "—" : `${formatEth(stats.raised, 3)} ETH`}</dd>
+              </div>
+            </dl>
           </div>
-          <div className="strip" ref={strip}>
-            {isLoading
-              ? Array.from({ length: 4 }).map((_, i) => (
-                  <div key={i} className="top-card">
-                    <Skeleton height="100%" width={120} radius={0} />
-                    <div className="top-body">
-                      <Skeleton width="70%" />
-                      <Skeleton width="50%" />
-                    </div>
-                  </div>
-                ))
-              : top.map((launch) => <TopCard key={launch.address} launch={launch} createdAt={created(launch)} />)}
+          <div className="hero-side">
+            {isLoading ? (
+              <div className="spotlight">
+                <Skeleton height={64} width={64} radius={16} />
+                <Skeleton width="60%" />
+                <Skeleton height={48} />
+                <Skeleton height={8} />
+              </div>
+            ) : spotlight ? (
+              <SpotlightCard launch={spotlight} createdAt={created(spotlight)} />
+            ) : (
+              <div className="spotlight spotlight-empty">
+                <span className="spotlight-tag">Spotlight</span>
+                <p className="muted">The first launch on this network will appear here.</p>
+                <Link to="/create" className="btn btn-primary btn-sm">
+                  Be the first
+                </Link>
+              </div>
+            )}
           </div>
         </section>
       )}
 
       <section className="container block">
         <div className="block-head">
-          <h2>{query ? `Results for “${params.get("q")}”` : "All launches"}</h2>
+          <h2>{query ? `Results for “${params.get("q")}”` : "Explore launches"}</h2>
           {data && <span className="muted small">{data.count} total</span>}
         </div>
 
@@ -144,16 +175,18 @@ export function Explore() {
         </div>
 
         {isLoading ? (
-          <div className="tiles">
-            {Array.from({ length: 12 }).map((_, i) => (
-              <div key={i} className="tile">
-                <div className="tile-art">
-                  <Skeleton height="100%" radius={0} />
+          <div className="cards">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <div key={i} className="lcard">
+                <div className="lcard-head">
+                  <Skeleton height={44} width={44} radius={12} />
+                  <div className="lcard-names">
+                    <Skeleton width="70%" height={12} />
+                    <Skeleton width="40%" height={10} />
+                  </div>
                 </div>
-                <div className="tile-body">
-                  <Skeleton width="70%" height={12} />
-                  <Skeleton width="45%" height={12} />
-                </div>
+                <Skeleton height={34} width="60%" />
+                <Skeleton height={6} />
               </div>
             ))}
           </div>
@@ -169,9 +202,9 @@ export function Explore() {
             {query ? "Try a name, a symbol, or paste the full token address." : "Launches appear here the moment they are created."}
           </EmptyState>
         ) : view === "grid" ? (
-          <div className="tiles">
+          <div className="cards">
             {shown.map((launch) => (
-              <LaunchTile key={launch.address} launch={launch} createdAt={created(launch)} />
+              <LaunchCard key={launch.address} launch={launch} createdAt={created(launch)} />
             ))}
           </div>
         ) : (

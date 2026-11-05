@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useAccount } from "wagmi";
 import { isAddress, type Address } from "viem";
@@ -17,11 +17,16 @@ export function Token() {
   const { address: param } = useParams();
   const token = param && isAddress(param) ? (param as Address) : undefined;
   const { data: launch, isLoading, isError, error } = useLaunch(token);
-  const { data: trades, isLoading: tradesLoading } = useTrades(launch?.record.curve, launch?.virtualQuote, launch?.supply);
+  const { data: trades, isLoading: tradesLoading } = useTrades(launch);
   const { data: times } = useLaunchTimes();
   const { address } = useAccount();
   const { send, busy } = useTx();
   const [tab, setTab] = useState<Tab>("trades");
+
+  const volume24h = useMemo(() => {
+    const since = Date.now() / 1000 - 86_400;
+    return (trades ?? []).filter((t) => t.timestamp >= since).reduce((sum, t) => sum + t.quote, 0n);
+  }, [trades]);
 
   if (!token) {
     return (
@@ -69,6 +74,7 @@ export function Token() {
   const windowEnds = launch.openedAt + launch.openingTaxWindow;
   const openingActive = launch.openingTaxStartBps > 0 && Date.now() / 1000 < windowEnds;
   const recent = [...(trades ?? [])].reverse();
+  const listed = launch.record.phase === PHASE.Listed;
 
   return (
     <div className="container page">
@@ -91,21 +97,30 @@ export function Token() {
             </div>
           </div>
         </div>
-        <div className="token-figures">
-          <div>
-            <span className="label">Market cap</span>
-            <span className="figure">{formatEth(launch.marketCap, 3)} ETH</span>
-          </div>
-          <div>
-            <span className="label">Since launch</span>
-            <span className="figure">
-              <Change bps={launch.changeBps} />
-            </span>
-          </div>
-          <div className="hide-sm">
-            <span className="label">Raised</span>
-            <span className="figure">{formatEth(launch.raised, 4)} ETH</span>
-          </div>
+      </div>
+
+      <div className="stat-strip">
+        <div>
+          <span className="label">Price</span>
+          <span className="figure mono">{formatPrice(launch.priceWad)} ETH</span>
+        </div>
+        <div>
+          <span className="label">Market cap</span>
+          <span className="figure">{formatEth(launch.marketCap, 3)} ETH</span>
+        </div>
+        <div>
+          <span className="label">Since launch</span>
+          <span className="figure">
+            <Change bps={launch.changeBps} />
+          </span>
+        </div>
+        <div>
+          <span className="label">24h volume</span>
+          <span className="figure">{trades ? `${formatEth(volume24h, 4)} ETH` : "—"}</span>
+        </div>
+        <div>
+          <span className="label">{listed ? "Trading in" : "Raised"}</span>
+          <span className="figure">{listed ? "Locked pool" : `${formatEth(launch.raised, 4)} ETH`}</span>
         </div>
       </div>
 
@@ -151,6 +166,7 @@ export function Token() {
                         <tr key={`${t.hash}-${t.kind}-${t.tokens}`}>
                           <td>
                             <span className={`side side-${t.kind}`}>{t.kind === "buy" ? "Buy" : "Sell"}</span>
+                            <span className="venue-tag">{t.venue === "pool" ? "Pool" : "Curve"}</span>
                           </td>
                           <td className="num mono">{formatPrice(t.priceAfter)}</td>
                           <td className="num mono">{formatEth(t.quote, 4)}</td>
@@ -249,30 +265,64 @@ export function Token() {
               <TradePanel launch={launch} />
             </div>
 
-            <div className="panel">
-              <div className="row-between">
-                <span className="label">Bonding curve</span>
-                <span className="mono small">{formatPercent(launch.progressBps)}</span>
+            {listed ? (
+              <div className="panel">
+                <div className="row-between">
+                  <span className="label">Locked pool</span>
+                  <span className="badge badge-blue">Graduated</span>
+                </div>
+                <div className="kv compact">
+                  <div>
+                    <span className="muted">Pool</span>
+                    {launch.pool ? (
+                      <a className="mono" href={`${deployment.explorer}/address/${launch.pool}`} target="_blank" rel="noreferrer">
+                        {shortAddress(launch.pool)}
+                      </a>
+                    ) : (
+                      <span>—</span>
+                    )}
+                  </div>
+                  <div>
+                    <span className="muted">Fee tier</span>
+                    <span className="mono">{formatPercent(launch.record.venueFee / 100, 0)}</span>
+                  </div>
+                  <div>
+                    <span className="muted">Raised on the curve</span>
+                    <span className="mono">{formatEth(launch.record.graduationTarget, 4)} ETH</span>
+                  </div>
+                  <div>
+                    <span className="muted">Supply locked at graduation</span>
+                    <span className="mono">{formatCompact(launch.lockedSupply)}</span>
+                  </div>
+                </div>
+                <p className="muted small">The position belongs to the locker contract, which has no way to withdraw it. Pool fees are split like curve fees.</p>
               </div>
-              <Progress bps={launch.progressBps} label="Graduation progress" />
-              <div className="kv compact">
-                <div>
-                  <span className="muted">Raised</span>
-                  <span className="mono">
-                    {formatEth(launch.raised, 4)} / {formatEth(launch.record.graduationTarget, 4)} ETH
-                  </span>
+            ) : (
+              <div className="panel">
+                <div className="row-between">
+                  <span className="label">Bonding curve</span>
+                  <span className="mono small">{formatPercent(launch.progressBps)}</span>
                 </div>
-                <div>
-                  <span className="muted">Left on the curve</span>
-                  <span className="mono">{formatCompact(launch.sellable)}</span>
+                <Progress bps={launch.progressBps} label="Graduation progress" />
+                <div className="kv compact">
+                  <div>
+                    <span className="muted">Raised</span>
+                    <span className="mono">
+                      {formatEth(launch.raised, 4)} / {formatEth(launch.record.graduationTarget, 4)} ETH
+                    </span>
+                  </div>
+                  <div>
+                    <span className="muted">Left on the curve</span>
+                    <span className="mono">{formatCompact(launch.sellable)}</span>
+                  </div>
+                  <div>
+                    <span className="muted">Reserved for the pool</span>
+                    <span className="mono">{formatCompact(launch.reserveFloor)}</span>
+                  </div>
                 </div>
-                <div>
-                  <span className="muted">Reserved for the pool</span>
-                  <span className="mono">{formatCompact(launch.reserveFloor)}</span>
-                </div>
+                {openingActive && <p className="notice notice-warn">Opening tax is active and falls to zero by {new Date(windowEnds * 1000).toLocaleTimeString()}.</p>}
               </div>
-              {openingActive && <p className="notice notice-warn">Opening tax is active and falls to zero by {new Date(windowEnds * 1000).toLocaleTimeString()}.</p>}
-            </div>
+            )}
 
             <div className="panel">
               <span className="label">Guarantees</span>

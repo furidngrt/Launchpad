@@ -37,6 +37,8 @@ console.log(`verifying ${Object.keys(deployment.contracts).length} contracts on 
 
 let failures = 0;
 for (const [name, entry] of Object.entries(deployment.contracts)) {
+  // The free API allows three calls a second; space submissions out.
+  await sleep(1200);
   const existing = await get({ module: "contract", action: "getsourcecode", address: entry.address });
   if (existing.status === "1" && existing.result?.[0]?.SourceCode) {
     console.log(`${name.padEnd(18)} already verified`);

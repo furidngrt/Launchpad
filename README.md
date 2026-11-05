@@ -6,7 +6,7 @@ A creator deploys a token, the public buys it from a bonding curve that holds th
 
 There is no pre-allocation for the creator, no mint function on the launch token, no way for anyone to pause trading or move locked liquidity, and no way for the terms a creator was shown to change after they commit. These are not promises. They are the absence of the functions that would be needed.
 
-**Status: unaudited, live on Sepolia.** Every contract fits the deployed-code limit, 41 tests pass against a real EVM, and the full stack is deployed and source-verified on Ethereum Sepolia, where an end-to-end graduation was run against the real Uniswap V3 deployment with a sabotaged pool. It has not been through an independent security review. Treat it accordingly.
+**Status: unaudited, live on Sepolia.** Every contract fits the deployed-code limit, 43 tests pass against a real EVM, and the full stack is deployed and source-verified on Ethereum Sepolia, where an end-to-end graduation was run against the real Uniswap V3 deployment with a sabotaged pool. It has not been through an independent security review. Treat it accordingly.
 
 ---
 
@@ -71,6 +71,7 @@ Selling closes slightly before buying does. The moment the curve is bought out i
 | `FeeCollector` | Converts and splits the fees a launch earns after graduation. |
 | `LaunchRouter` | Optional. Creates a launch and makes the first buy in one transaction. |
 | `LaunchLens` | Read-only. Paged lists of launches and a launch's whole picture in one call. |
+| `PoolRouter` | Trades a graduated launch against its pool in ETH, with exact on-chain quotes, so it keeps trading in the same interface. Stateless, no admin. |
 | `AmmV3Venue` | Adapter for a concentrated-liquidity AMM. The only contract that knows how one works, and the one that refuses to list at a price it did not choose. |
 
 The core never names an AMM. Supporting a different one means deploying another adapter, and because every launch records the adapter it was created with, doing so leaves existing launches exactly where they are.
@@ -173,6 +174,8 @@ Exempt wallets are capped while the window is open. Together they may buy at mos
 If you are quoting a trade, read `openingTaxBps(recipient)` and apply it. It is keyed on the wallet receiving the tokens rather than the sender, so a router must ask about its end user.
 
 ### After graduation
+
+A graduated launch keeps trading in the same place. `PoolRouter` swaps ETH for the token and back directly against the locked pool: it wraps and unwraps the native asset itself, refunds anything the pool does not take, enforces a minimum output and a deadline, and quotes by simulating the exact swap, so a quote is what the pool would do at that moment. It depends on no external router, holds nothing between calls and has no admin. Anyone can still trade the pool through any other interface.
 
 After graduation the pool's own fee tier is the fee. On the reference configuration that tier is 1%, the same rate as the curve's trade fee, and it is split protocol, buyback and creator exactly as on the curve. The creator's own extra fee does not carry over, because an ordinary pool has no way to charge one.
 
@@ -357,7 +360,7 @@ npm run build
 npm test
 ```
 
-`npm run build` compiles with the bundled `solc`, writes artifacts to `out/` together with the exact standard-JSON compiler input used for explorer verification, and fails if any contract exceeds the 24,576-byte deployed-code limit. `npm test` compiles the mocks too and runs 41 tests against an in-process EVM, including a randomised trading run that checks solvency, token conservation and quote exactness after every step. The mock pool is faithful to what the venue relies on: anyone may initialize it, a swap through zero liquidity moves its price for free, and payment is checked after the callback.
+`npm run build` compiles with the bundled `solc`, writes artifacts to `out/` together with the exact standard-JSON compiler input used for explorer verification, and fails if any contract exceeds the 24,576-byte deployed-code limit. `npm test` compiles the mocks too and runs 43 tests against an in-process EVM, including a randomised trading run that checks solvency, token conservation and quote exactness after every step. The mock pool is faithful to what the venue relies on: anyone may initialize it, a swap through zero liquidity moves its price for free, and payment is checked after the callback.
 
 Current sizes:
 
@@ -408,7 +411,7 @@ The smoke test creates a launch on the cheap configuration, sabotages its pool t
 Pages:
 
 - **Tokens**: top launches, then every launch as a grid or a list, filterable by top, new, near graduation and graduated, with search by name, symbol or address.
-- **Token**: candles or line chart from 1m to 4h, trades, details, buy and sell with slippage control, curve progress, and the finishing transaction for a launch that is ready to graduate. After graduation the panel links to the locked Uniswap pool.
+- **Token**: candles or line chart from 1m to 4h, trades, details, buy and sell with slippage control, curve progress, and the finishing transaction for a launch that is ready to graduate. After graduation the same panel trades against the locked pool through `PoolRouter`, with live quotes, price impact and a deadline, and the chart and trade list continue from the curve into the pool.
 - **Create**: name, image and links, curve terms, creator fee, buyback toggle and an optional opening buy in the same transaction. The economics are pinned, so the launch reverts if the terms change before it lands.
 - **Portfolio**: claimable escrow balance, the launches you created with their pending fees, and your holdings.
 - **How it works**: the lifecycle, the fee split, the live terms and the verified contract addresses.
@@ -453,6 +456,7 @@ Chain id 11155111. Graduates into the official Uniswap V3 deployment: position m
 | `FeeEscrow` | [`0x1146e1558a15B9C7eA6a9a9fBD25F2583D5ee09d`](https://sepolia.etherscan.io/address/0x1146e1558a15B9C7eA6a9a9fBD25F2583D5ee09d#code) |
 | `BuybackVault` | [`0x8cb4d6d9d5C4B22E3cCd589bC4FBD30abf65e084`](https://sepolia.etherscan.io/address/0x8cb4d6d9d5C4B22E3cCd589bC4FBD30abf65e084#code) |
 | `FeeCollector` | [`0xa65D42283231186834BEa3350645853060B55a70`](https://sepolia.etherscan.io/address/0xa65D42283231186834BEa3350645853060B55a70#code) |
+| `PoolRouter` | [`0xc856Ad88782a843EFe2d552c7d092c34d1a35428`](https://sepolia.etherscan.io/address/0xc856Ad88782a843EFe2d552c7d092c34d1a35428#code) |
 
 Two configurations are live. Both use a supply of one billion, a 1% trade fee and a 1% pool tier with tick spacing 200, and both rise 12.25× across the curve.
 
@@ -473,6 +477,8 @@ Valuation is price times total supply. It opens at the virtual reserve and gradu
 | Seeded | 204,081,632.65 tokens and 0.01 ETH |
 | Position owner | the locker |
 | Remainder | 17,743 tokens locked, 0.000178 ETH credited to the treasury |
+
+**Live trading after graduation.** Through `PoolRouter`, a [buy of 0.0005 ETH](https://sepolia.etherscan.io/tx/0xe360440df1ded13cd35050c5b7dc27a9b6c248b41ed99a2cfabced52d7fa0e14) and a [sale of half of it](https://sepolia.etherscan.io/tx/0xc2639ec01325cd817be3cda09aa10336c500d8a101983164fd822c39365c1525) in the same pool each settled at exactly the amount quoted beforehand.
 
 ## Design notes
 

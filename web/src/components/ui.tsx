@@ -45,18 +45,6 @@ export function TokenAvatar({ logo, symbol, size = 40, rounded = 10 }: { logo?: 
   );
 }
 
-/** The square artwork on a launch tile: the token's image, or its ticker on a flat tile. */
-export function TokenArt({ logo, symbol }: { logo?: string; symbol: string }) {
-  const [failed, setFailed] = useState(false);
-  const src = resolveMedia(logo);
-  if (src && !failed) return <img className="art" src={src} alt="" loading="lazy" onError={() => setFailed(true)} />;
-  return (
-    <span className="art art-fallback" style={{ background: toneFor(symbol) }} aria-hidden>
-      {symbol.slice(0, 3).toUpperCase() || "?"}
-    </span>
-  );
-}
-
 export function PhaseBadge({ phase }: { phase: number }) {
   const tone = phase === 0 ? "green" : phase === 2 ? "blue" : phase === 1 ? "amber" : "red";
   return <span className={`badge badge-${tone}`}>{PHASE_LABEL[phase] ?? "Unknown"}</span>;

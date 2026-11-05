@@ -16,6 +16,10 @@ export const PHASE_LABEL: Record<number, string> = {
 
 const C = deployment.contracts;
 const poolAbi = parseAbi(["function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)"]);
+const poolEventsAbi = parseAbi([
+  "event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)",
+  "event Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)",
+]);
 const Q192 = 1n << 192n;
 const WAD = 10n ** 18n;
 
@@ -88,12 +92,16 @@ async function poolPrice(record: LaunchRecord): Promise<{ pool?: Address; priceW
   const slot = (await reader.readContract({ address: pool, abi: poolAbi, functionName: "slot0" })) as readonly [bigint, ...unknown[]];
   const sqrt = slot[0];
   if (sqrt === 0n) return { pool, priceWad: 0n };
-  const tokenIsFirst = record.token.toLowerCase() < deployment.wrappedNative.toLowerCase();
+  return { pool, priceWad: priceFromSqrt(record.token, sqrt) };
+}
+
+/** A pool's sqrt price as the price of one whole token in ETH, scaled by 1e18.
+ * Both sides carry 18 decimals, so the raw ratio is already per whole token. */
+export function priceFromSqrt(token: Address, sqrt: bigint): bigint {
+  if (sqrt === 0n) return 0n;
+  const tokenIsFirst = token.toLowerCase() < deployment.wrappedNative.toLowerCase();
   const squared = sqrt * sqrt;
-  // Both sides carry 18 decimals, so the pool's raw price is already a price
-  // per whole token.
-  const priceWad = tokenIsFirst ? (squared * WAD) / Q192 : (Q192 * WAD) / squared;
-  return { pool, priceWad };
+  return tokenIsFirst ? (squared * WAD) / Q192 : (Q192 * WAD) / squared;
 }
 
 async function summarize(address: Address, index: number): Promise<LaunchSummary> {
@@ -248,6 +256,8 @@ export function useLaunch(address: Address | undefined) {
 
 export interface Trade {
   kind: "buy" | "sell";
+  /** Where the trade happened: on the bonding curve, or in the locked pool. */
+  venue: "curve" | "pool";
   account: Address;
   quote: bigint;
   tokens: bigint;
@@ -268,28 +278,40 @@ interface CurveLog {
 }
 
 /**
- * Every trade on a launch's curve, oldest first, with the exact spot price on
- * either side of it.
+ * Every trade on a launch, oldest first, with the exact spot price on either
+ * side of it: first on its curve, then in its pool once it has graduated.
  *
  * The curve's pricing reserves are a pure function of its events, so they are
  * replayed from the opening state rather than read per block: the virtual
  * reserve and the full supply to start, each buy adding its net quote and
  * removing its tokens, each sell the reverse, and each buyback leaving its
- * quote in and taking its tokens out. That gives true candles instead of
- * averaged fills, at the cost of one log query.
+ * quote in and taking its tokens out. Pool swaps carry the price they leave
+ * behind, and the pool opens at the curve's final price, so the series runs on
+ * without a gap.
  */
-export function useTrades(curve: Address | undefined, virtualQuote: bigint | undefined, supply: bigint | undefined) {
+export function useTrades(launch: LaunchDetail | undefined) {
+  const curve = launch?.record.curve;
+  const pool = launch?.pool;
   return useQuery({
-    queryKey: ["trades", curve],
-    enabled: !!curve && virtualQuote !== undefined && supply !== undefined,
+    queryKey: ["trades", curve, pool],
+    enabled: !!launch,
     refetchInterval: 12_000,
     queryFn: async (): Promise<Trade[]> => {
+      const l = launch as LaunchDetail;
       const latest = await reader.getBlock({ blockTag: "latest" });
-      const logs = await logsInWindows(curve as Address, abis.BondingCurve, latest.number);
-      logs.sort((a, b) => (a.blockNumber === b.blockNumber ? a.logIndex - b.logIndex : Number(a.blockNumber - b.blockNumber)));
+      const stamp = (block: bigint) => Number(latest.timestamp) - Number(latest.number - block) * 12;
+      const [logs, poolLogs, routed] = await Promise.all([
+        logsInWindows(l.record.curve, abis.BondingCurve, latest.number),
+        pool ? logsInWindows(pool, poolEventsAbi, latest.number) : Promise.resolve([] as CurveLog[]),
+        pool ? logsInWindows(C.PoolRouter, abis.PoolRouter, latest.number, "Swap", { token: l.address }) : Promise.resolve([] as CurveLog[]),
+      ]);
+      const byOrder = (a: CurveLog, b: CurveLog) =>
+        a.blockNumber === b.blockNumber ? a.logIndex - b.logIndex : Number(a.blockNumber - b.blockNumber);
+      logs.sort(byOrder);
+      poolLogs.sort(byOrder);
 
-      let Q = virtualQuote as bigint;
-      let T = supply as bigint;
+      let Q = l.virtualQuote;
+      let T = l.supply;
       const spot = () => (T === 0n ? 0n : (Q * WAD) / T);
       const trades: Trade[] = [];
 
@@ -310,6 +332,7 @@ export function useTrades(curve: Address | undefined, virtualQuote: bigint | und
           }
           trades.push({
             kind: isBuy ? "buy" : "sell",
+            venue: "curve",
             account: (a.recipient ?? a.buyer ?? a.seller) as Address,
             quote,
             tokens,
@@ -317,11 +340,45 @@ export function useTrades(curve: Address | undefined, virtualQuote: bigint | und
             priceAfter: spot(),
             block: log.blockNumber,
             hash: log.transactionHash,
-            timestamp: Number(latest.timestamp) - Number(latest.number - log.blockNumber) * 12,
+            timestamp: stamp(log.blockNumber),
           });
         } else if (log.eventName === "FeesSwept" && (a.tokensLocked as bigint) > 0n) {
           Q += a.buybackAmount as bigint;
           T -= a.tokensLocked as bigint;
+        }
+      }
+
+      if (pool) {
+        // The listing transaction mints the locked position and, if someone
+        // had mispriced the pool beforehand, swaps it back to the curve's
+        // price. That correction is part of graduation, not a trade.
+        const listingTxs = new Set(poolLogs.filter((x) => x.eventName === "Mint").map((x) => x.transactionHash));
+        const traders = new Map(routed.map((x) => [x.transactionHash, x.args.trader as Address]));
+        const tokenIsFirst = l.address.toLowerCase() < deployment.wrappedNative.toLowerCase();
+        let last = trades.length ? trades[trades.length - 1].priceAfter : l.openPriceWad;
+        for (const log of poolLogs) {
+          if (log.eventName !== "Swap") continue;
+          const a = log.args;
+          const after = priceFromSqrt(l.address, a.sqrtPriceX96 as bigint);
+          if (listingTxs.has(log.transactionHash)) {
+            last = after;
+            continue;
+          }
+          const tokenDelta = (tokenIsFirst ? a.amount0 : a.amount1) as bigint;
+          const quoteDelta = (tokenIsFirst ? a.amount1 : a.amount0) as bigint;
+          trades.push({
+            kind: tokenDelta < 0n ? "buy" : "sell",
+            venue: "pool",
+            account: traders.get(log.transactionHash) ?? (a.recipient as Address),
+            quote: quoteDelta < 0n ? -quoteDelta : quoteDelta,
+            tokens: tokenDelta < 0n ? -tokenDelta : tokenDelta,
+            priceBefore: last,
+            priceAfter: after,
+            block: log.blockNumber,
+            hash: log.transactionHash,
+            timestamp: stamp(log.blockNumber),
+          });
+          last = after;
         }
       }
       return trades;
@@ -330,12 +387,25 @@ export function useTrades(curve: Address | undefined, virtualQuote: bigint | und
 }
 
 /** Logs for one address from the deployment block onwards, in windows a public node will serve. */
-async function logsInWindows(address: Address, abi: (typeof abis)[keyof typeof abis], latest: bigint, eventName?: string): Promise<CurveLog[]> {
+async function logsInWindows(
+  address: Address,
+  abi: (typeof abis)[keyof typeof abis] | typeof poolEventsAbi,
+  latest: bigint,
+  eventName?: string,
+  args?: Record<string, unknown>,
+): Promise<CurveLog[]> {
   const span = 45_000n;
   const all: CurveLog[] = [];
   for (let from = deployment.startBlock; from <= latest; from += span) {
     const to = from + span - 1n > latest ? latest : from + span - 1n;
-    const logs = await reader.getContractEvents({ address, abi, fromBlock: from, toBlock: to, ...(eventName ? { eventName } : {}) });
+    const logs = await reader.getContractEvents({
+      address,
+      abi: abi as (typeof abis)[keyof typeof abis],
+      fromBlock: from,
+      toBlock: to,
+      ...(eventName ? { eventName } : {}),
+      ...(args ? { args } : {}),
+    });
     all.push(...(logs as unknown as CurveLog[]));
   }
   return all;
