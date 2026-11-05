@@ -1,0 +1,23 @@
+{
+  "name": "launchpad-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bonding-curve token launchpad with permanently locked graduated liquidity",
+  "license": "MIT",
+  "scripts": {
+    "build": "node tools/compile.mjs",
+    "test": "node tools/test.mjs"
+  },
+  "devDependencies": {
+    "@ethereumjs/common": "4.4.0",
+    "@ethereumjs/evm": "3.1.0",
+    "@ethereumjs/statemanager": "2.4.0",
+    "@ethereumjs/util": "9.1.0",
+    "@ethereumjs/vm": "8.1.0",
+    "ethers": "6.13.4",
+    "solc": "0.8.28"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.1.0"
+  }
+}
