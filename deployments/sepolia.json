@@ -1,0 +1,108 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "deployer": "0xe760F19b7F9C94880b8F21BDf2abc191F5e32290",
+  "admin": "0xe760F19b7F9C94880b8F21BDf2abc191F5e32290",
+  "treasury": "0xe760F19b7F9C94880b8F21BDf2abc191F5e32290",
+  "positionManager": "0x1238536071E1c677A632429e3655c799b22cDA52",
+  "wrappedNative": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+  "contracts": {
+    "FeeEscrow": {
+      "address": "0x1146e1558a15B9C7eA6a9a9fBD25F2583D5ee09d",
+      "source": "src/FeeEscrow.sol:FeeEscrow",
+      "constructorArgs": "0x",
+      "transaction": "0xc7444e582221ace52be6cb272af85a9582376f2353fd5d16af3c66a14374b36a",
+      "block": 12067551,
+      "gasUsed": "3463225"
+    },
+    "BuybackVault": {
+      "address": "0x8cb4d6d9d5C4B22E3cCd589bC4FBD30abf65e084",
+      "source": "src/BuybackVault.sol:BuybackVault",
+      "constructorArgs": "0x0000000000000000000000001146e1558a15b9c7ea6a9a9fbd25f2583d5ee09d000000000000000000000000e760f19b7f9c94880b8f21bdf2abc191f5e32290",
+      "transaction": "0xb4d2fbf4f445d665b65e11c1c2f166e1ee61cb24520d3ba5238dff82781adf7b",
+      "block": 12067552,
+      "gasUsed": "7994563"
+    },
+    "LiquidityLocker": {
+      "address": "0xB40a72b2658beb3d66eF384D002B0F38D5EAbdB1",
+      "source": "src/LiquidityLocker.sol:LiquidityLocker",
+      "constructorArgs": "0x000000000000000000000000e760f19b7f9c94880b8f21bdf2abc191f5e32290",
+      "transaction": "0xce1ac32ea5a4e0107634c334c14724acb81ba3d6379175c61784f6fd90429b2a",
+      "block": 12067553,
+      "gasUsed": "4096831"
+    },
+    "AmmV3Venue": {
+      "address": "0xcf06b1E16575b327159F0909dc4BB4eb3ed9D988",
+      "source": "src/venues/AmmV3Venue.sol:AmmV3Venue",
+      "constructorArgs": "0x0000000000000000000000001238536071e1c677a632429e3655c799b22cda52000000000000000000000000fff9976782d46cc05630d1f6ebab18b2324d6b14",
+      "transaction": "0xbece5fbbdb7460794798e6455d85564aae34d19dbea5d457e1b381c69c0abb50",
+      "block": 12067554,
+      "gasUsed": "11450163"
+    },
+    "LaunchFactory": {
+      "address": "0xC9804B2255aECA7640C241363990a0D3aDa4ec1F",
+      "source": "src/LaunchFactory.sol:LaunchFactory",
+      "constructorArgs": "0x000000000000000000000000e760f19b7f9c94880b8f21bdf2abc191f5e32290000000000000000000000000000000000000000000000000000000000002a3000000000000000000000000001146e1558a15b9c7ea6a9a9fbd25f2583d5ee09d0000000000000000000000008cb4d6d9d5c4b22e3ccd589bc4fbd30abf65e084000000000000000000000000b40a72b2658beb3d66ef384d002b0f38d5eabdb1000000000000000000000000cf06b1e16575b327159f0909dc4bb4eb3ed9d988000000000000000000000000e760f19b7f9c94880b8f21bdf2abc191f5e322900000000000000000000000000000000000000000000000000001c6bf52634000",
+      "transaction": "0x4bcc3178e7268eb9ab3ee2bb03112aa8c7dbe009bb1c9ee72f116b1914cbc4e1",
+      "block": 12067555,
+      "gasUsed": "38521838"
+    },
+    "LaunchDeployer": {
+      "address": "0xDDc14Ab7A5255227982BB3e15e05B9ae0884e910",
+      "source": "src/LaunchDeployer.sol:LaunchDeployer",
+      "constructorArgs": "0x000000000000000000000000c9804b2255aeca7640c241363990a0d3ada4ec1f",
+      "transaction": "0xfb6bdd5934cd647304d6592fa5c7e43e94b06f4421cbc78cd57800dce6d5da96",
+      "block": 12067556,
+      "gasUsed": "35734090"
+    },
+    "FeeCollector": {
+      "address": "0xa65D42283231186834BEa3350645853060B55a70",
+      "source": "src/FeeCollector.sol:FeeCollector",
+      "constructorArgs": "0x000000000000000000000000c9804b2255aeca7640c241363990a0d3ada4ec1f000000000000000000000000b40a72b2658beb3d66ef384d002b0f38d5eabdb10000000000000000000000001146e1558a15b9c7ea6a9a9fbd25f2583d5ee09d0000000000000000000000008cb4d6d9d5c4b22e3ccd589bc4fbd30abf65e084",
+      "transaction": "0x3c8abdf1f8cfd5934106188dc186ab374dbe0968d21511d4cfea2aa7d1eb272b",
+      "block": 12067557,
+      "gasUsed": "7451672"
+    },
+    "LaunchRouter": {
+      "address": "0x8a8E7ed303A7C4f1939f61cE9B737821A965578e",
+      "source": "src/LaunchRouter.sol:LaunchRouter",
+      "constructorArgs": "0x000000000000000000000000c9804b2255aeca7640c241363990a0d3ada4ec1f",
+      "transaction": "0xd384a50249dadd280e8168d6a15e964f63628f27a4dfddb9bdcc79f88f51f0e3",
+      "block": 12067558,
+      "gasUsed": "5584781"
+    },
+    "LaunchLens": {
+      "address": "0x5a610cd3F7019D109d284f60B3189C3e098870Cb",
+      "source": "src/LaunchLens.sol:LaunchLens",
+      "constructorArgs": "0x000000000000000000000000c9804b2255aeca7640c241363990a0d3ada4ec1f",
+      "transaction": "0x8cfec55b36deae97334e6099e3ab0b595319e4c97170aec74a199770864e988d",
+      "block": 12067559,
+      "gasUsed": "4868262"
+    }
+  },
+  "configs": [
+    {
+      "id": 0,
+      "label": "reference",
+      "supply": "1000000000000000000000000000",
+      "virtualQuote": "1680000000000000000",
+      "graduationTarget": "4200000000000000000",
+      "tradeFeeBps": 100,
+      "venueFee": 10000,
+      "tickSpacing": 200,
+      "enabled": true
+    },
+    {
+      "id": 1,
+      "label": "smoke-test",
+      "supply": "1000000000000000000000000000",
+      "virtualQuote": "4000000000000000",
+      "graduationTarget": "10000000000000000",
+      "tradeFeeBps": 100,
+      "venueFee": 10000,
+      "tickSpacing": 200,
+      "enabled": true
+    }
+  ],
+  "launchEnabled": true
+}

@@ -124,6 +124,10 @@ interface IFeeEscrow {
 
     function claimToken(address token, uint256 amount) external returns (uint256);
 
+    function claimTo(address to, uint256 amount) external returns (uint256);
+
+    function claimTokenTo(address token, address to, uint256 amount) external returns (uint256);
+
     function balanceOf(address recipient) external view returns (uint256);
 
     function balanceOfToken(address recipient, address token) external view returns (uint256);
@@ -227,15 +231,24 @@ interface ILiquidityVenue {
         address lockTo;
     }
 
-    /// @notice Creates the pool, seeds it with the amounts supplied, and
-    /// transfers the whole position to `lockTo`, from where it can never be
-    /// withdrawn.
+    /// @notice Creates the pool, or restores an existing one to the price the
+    /// amounts imply, seeds it, and mints the whole position to `lockTo`, from
+    /// where it can never be withdrawn. Whatever the mint does not take is
+    /// returned to the caller.
     function list(Listing calldata listing) external payable returns (uint256 positionId, address pool);
 
     /// @notice Reverts unless a seed of these amounts would be accepted.
-    function checkSeed(address token, address quote, int24 tickSpacing, uint256 tokenAmount, uint256 quoteAmount)
-        external
-        view;
+    function checkSeed(
+        address token,
+        address quote,
+        uint24 fee,
+        int24 tickSpacing,
+        uint256 tokenAmount,
+        uint256 quoteAmount
+    ) external view;
+
+    /// @notice Reverts unless `fee` is an enabled tier with exactly `tickSpacing`.
+    function checkFeeTier(uint24 fee, int24 tickSpacing) external view;
 
     /// @notice The ERC-721 registry that records liquidity positions. The
     /// locker reads it to confirm custody and to collect fees.

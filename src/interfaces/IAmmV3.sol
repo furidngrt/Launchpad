@@ -7,6 +7,10 @@ pragma solidity ^0.8.28;
 
 interface IAmmFactory {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+
+    /// @notice Tick spacing the AMM enforces for a fee tier, or zero when the
+    /// tier is not enabled.
+    function feeAmountTickSpacing(uint24 fee) external view returns (int24);
 }
 
 interface IPositionManager {
@@ -50,38 +54,20 @@ interface IPositionFees {
     }
 
     function collect(CollectParams calldata params) external payable returns (uint256 amount0, uint256 amount1);
-
-    function positions(uint256 tokenId)
-        external
-        view
-        returns (
-            uint96 nonce,
-            address operator,
-            address token0,
-            address token1,
-            uint24 fee,
-            int24 tickLower,
-            int24 tickUpper,
-            uint128 liquidity,
-            uint256 feeGrowthInside0LastX128,
-            uint256 feeGrowthInside1LastX128,
-            uint128 tokensOwed0,
-            uint128 tokensOwed1
-        );
 }
 
-interface ISwapRouter {
-    struct ExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-        uint160 sqrtPriceLimitX96;
-    }
+/// @notice A pool's own swap entry point, used directly so the protocol needs
+/// no router and inherits no router's parameter layout.
+interface IAmmPool {
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
 
-    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+    function liquidity() external view returns (uint128);
 }
 
 interface IWrappedNative {

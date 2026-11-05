@@ -78,6 +78,10 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
     /// close a launch to the public for minutes.
     uint256 public constant MAX_OPENING_TAX_WINDOW = 60;
 
+    /// @dev Ceiling on how much of the supply tax-exempt wallets may buy, in
+    /// total, while the opening window is open.
+    uint256 public constant MAX_OPENING_EXEMPT_CAP_BPS = 2_500;
+
     /// @dev Bound on the creator-declared exemption list.
     uint256 public constant MAX_EXEMPTIONS = 32;
 
@@ -168,7 +172,8 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
     event LaunchEnabledUpdated(bool enabled);
     event WhitelistUpdated(address indexed account, bool allowed);
     event MaxCreatorFeeUpdated(uint16 bps);
-    event OpeningTaxUpdated(uint256 startBps, uint256 window);
+    event OpeningTaxUpdated(uint256 startBps, uint256 window, uint256 exemptCapBps);
+    event ListingRemainderHandled(address indexed token, uint256 tokensLocked, uint256 quoteToTreasury);
     event VenueUpdated(address venue);
     event FeeSweepOperatorUpdated(address operator);
     event ForwarderUpdated(address forwarder);
@@ -224,6 +229,10 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
 
     /// @notice Seconds across which the opening tax decays to zero.
     uint256 public openingTaxWindow = 5;
+
+    /// @notice Share of supply, in bps, that tax-exempt wallets may buy in
+    /// total while the opening window is open.
+    uint256 public openingExemptCapBps = 1_000;
 
     mapping(address account => bool allowed) public whitelisted;
     mapping(address asset => bool approved) public approvedQuoteAssets;
@@ -289,6 +298,10 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
     /// new launches may still select it can move.
     function addLaunchConfig(LaunchConfig calldata config) external onlyRole(CONFIG_ROLE) returns (uint256 configId) {
         _validateConfig(config);
+        // A fee tier the venue does not support, or one paired with the wrong
+        // spacing, would make every graduation on this configuration fail.
+        // Caught here, before a single launch can be created against it.
+        ILiquidityVenue(venue).checkFeeTier(config.venueFee, config.tickSpacing);
         configId = _configs.length;
         _configs.push(config);
         emit LaunchConfigAdded(configId, config);
@@ -383,15 +396,19 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
     /// retune can never reprice a window that is already running. Zero disables
     /// the tax for launches created while it is zero. A non-zero rate must
     /// exceed the ordinary combined fee ceiling, so the opening window always
-    /// dominates the normal cost of trading.
-    function setOpeningTax(uint256 startBps, uint256 window) external onlyRole(CONFIG_ROLE) {
+    /// dominates the normal cost of trading. `exemptCapBps` bounds how much of
+    /// the supply the creator and their declared wallets may take untaxed
+    /// before the window closes.
+    function setOpeningTax(uint256 startBps, uint256 window, uint256 exemptCapBps) external onlyRole(CONFIG_ROLE) {
         if (startBps != 0 && (startBps <= MAX_TOTAL_FEE_BPS || startBps > MAX_OPENING_TAX_START_BPS)) {
             revert InvalidBps();
         }
         if (window == 0 || window > MAX_OPENING_TAX_WINDOW) revert InvalidParams();
+        if (exemptCapBps > MAX_OPENING_EXEMPT_CAP_BPS) revert InvalidBps();
         openingTaxStartBps = startBps;
         openingTaxWindow = window;
-        emit OpeningTaxUpdated(startBps, window);
+        openingExemptCapBps = exemptCapBps;
+        emit OpeningTaxUpdated(startBps, window, exemptCapBps);
     }
 
     /// @notice Sets the AMM new launches graduate into.
@@ -462,21 +479,16 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
         return _allLaunches[index];
     }
 
-    /// @notice A page of launches, oldest first from `offset`.
-    function launchesPaged(uint256 offset, uint256 limit) external view returns (address[] memory page) {
-        uint256 total = _allLaunches.length;
-        if (offset >= total) return new address[](0);
-        uint256 end = offset + limit;
-        if (end > total) end = total;
-        page = new address[](end - offset);
-        for (uint256 i = offset; i < end; ++i) {
-            page[i - offset] = _allLaunches[i];
-        }
+    /// @notice Number of launches created by `creator`.
+    function launchCountOf(address creator) external view returns (uint256) {
+        return _launchesByCreator[creator].length;
     }
 
-    /// @notice Every launch created by `creator`.
-    function launchesOf(address creator) external view returns (address[] memory) {
-        return _launchesByCreator[creator];
+    /// @notice `creator`'s launch at `index`, oldest first.
+    /// @dev Paged reads over both lists live in `LaunchLens`, which keeps this
+    /// contract's deployed code within its size limit.
+    function launchOfAt(address creator, uint256 index) external view returns (address) {
+        return _launchesByCreator[creator][index];
     }
 
     /// @notice Whether `account` may create a launch right now.
@@ -493,8 +505,9 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
     /// launch graduates into, the venue, and the fee split that follows,
     /// because narrowing it to the reserve and target alone would let the
     /// supply, the trade fee or the pool's own fee tier move underneath a
-    /// pinned launch. The creator's own fee is deliberately absent: it is a
-    /// value they supply, so a cap change makes the launch revert on its own
+    /// pinned launch. The opening-tax terms and the launch fee are included
+    /// for the same reason. The creator's own fee is deliberately absent: it is
+    /// a value they supply, so a cap change makes the launch revert on its own
     /// rather than silently reprice.
     function previewEconomics(uint256 configId, address quote) external view returns (bytes32) {
         if (configId >= _configs.length) revert UnknownConfig();
@@ -889,6 +902,12 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
         address venue_ = record.venue;
         address quote = record.quote;
 
+        // Balances are measured around the venue call so that whatever it
+        // returns can be accounted for exactly. Both are held for many launches
+        // at once, so only the change across this call belongs to this one.
+        uint256 tokensHeld = IERC20(token).balanceOf(address(this));
+        uint256 quoteHeld = _heldQuote(quote);
+
         IERC20(token).forceApprove(venue_, tokenAmount);
         uint256 nativeValue;
         if (quote == address(0)) {
@@ -909,6 +928,43 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
             })
         );
         IERC20(token).forceApprove(venue_, 0);
+
+        uint256 tokensBack = IERC20(token).balanceOf(address(this)) - (tokensHeld - tokenAmount);
+        uint256 quoteBack = _heldQuote(quote) - (quoteHeld - quoteAmount);
+        _handleRemainder(token, quote, record, tokensBack, quoteBack);
+    }
+
+    /// @dev Disposes of what the mint did not take, so nothing a launch
+    /// graduated with is left sitting in this contract. Launch tokens are
+    /// locked with the rest of the supply that missed the pool, keeping the
+    /// guarantee that it never enters circulation. Quote goes to the protocol's
+    /// escrow balance, where it is accounted for and claimable rather than
+    /// stranded.
+    function _handleRemainder(
+        address token,
+        address quote,
+        Launch storage record,
+        uint256 tokensBack,
+        uint256 quoteBack
+    ) private {
+        if (tokensBack == 0 && quoteBack == 0) return;
+
+        if (tokensBack != 0) {
+            IERC20(token).forceApprove(address(locker), tokensBack);
+            locker.lockSupply(token, tokensBack);
+            IERC20(token).forceApprove(address(locker), 0);
+        }
+        if (quoteBack != 0) {
+            address treasury = _launchPolicies[record.token].treasury;
+            if (quote == address(0)) {
+                escrow.credit{value: quoteBack}(treasury);
+            } else {
+                IERC20(quote).forceApprove(address(escrow), quoteBack);
+                escrow.creditToken(treasury, quote, quoteBack);
+                IERC20(quote).forceApprove(address(escrow), 0);
+            }
+        }
+        emit ListingRemainderHandled(token, tokensBack, quoteBack);
     }
 
     /// @dev Tokens that may enter the pool without lowering its opening price.
@@ -924,7 +980,9 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
 
     function _assertSeedable(Launch storage record, uint256 quoteAmount, uint256 tokenAmount) private view {
         uint256 listing = _listingTokens(record, quoteAmount, tokenAmount);
-        ILiquidityVenue(record.venue).checkSeed(record.token, record.quote, record.tickSpacing, listing, quoteAmount);
+        ILiquidityVenue(record.venue).checkSeed(
+            record.token, record.quote, record.venueFee, record.tickSpacing, listing, quoteAmount
+        );
     }
 
     function _seedable(Launch storage record, uint256 quoteAmount, uint256 tokenAmount) private view returns (bool) {
@@ -961,8 +1019,10 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
         if (listing == 0) revert NothingToList();
         // The launch token does not exist yet, so neither does the address
         // ordering the pool will use. The venue is asked about both.
-        ILiquidityVenue(venue_).checkSeed(address(type(uint160).max), quote, config.tickSpacing, listing, target);
-        ILiquidityVenue(venue_).checkSeed(address(1), quote, config.tickSpacing, listing, target);
+        ILiquidityVenue(venue_).checkSeed(
+            address(type(uint160).max), quote, config.venueFee, config.tickSpacing, listing, target
+        );
+        ILiquidityVenue(venue_).checkSeed(address(1), quote, config.venueFee, config.tickSpacing, listing, target);
     }
 
     function _setFeeRecipient(address token, Launch storage record, address newRecipient) private {
@@ -1000,7 +1060,7 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
         uint256 virtualQuote,
         uint256 target,
         address venue_
-    ) private pure returns (bytes32) {
+    ) private view returns (bytes32) {
         return keccak256(
             abi.encode(
                 virtualQuote,
@@ -1012,7 +1072,11 @@ contract LaunchFactory is AccessControlDefaultAdminRules, ReentrancyGuard, ILaun
                 policy.treasuryShareBps,
                 policy.buybackShareBps,
                 policy.maxPriceImpactBps,
-                venue_
+                venue_,
+                openingTaxStartBps,
+                openingTaxWindow,
+                openingExemptCapBps,
+                launchFee
             )
         );
     }

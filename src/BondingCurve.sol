@@ -18,6 +18,8 @@ interface IOpeningTaxTerms {
     function openingTaxStartBps() external view returns (uint256);
 
     function openingTaxWindow() external view returns (uint256);
+
+    function openingExemptCapBps() external view returns (uint256);
 }
 
 /// @dev The operator allowed to run price-sensitive sweeps, and the callback
@@ -79,6 +81,7 @@ contract BondingCurve is ReentrancyGuard, IBondingCurve {
     error NativeValueMismatch(uint256 sent, uint256 expected);
     error UnexpectedNativeValue();
     error TransferFailed();
+    error OpeningAllocationExceeded(uint256 requested, uint256 remaining);
 
     /// @dev `fee` carries the trade fee and, inside the opening window, the
     /// opening tax folded in with it, because both are distributed the same
@@ -212,6 +215,19 @@ contract BondingCurve is ReentrancyGuard, IBondingCurve {
     /// opening tax, so a team's own bundled buys are not consumed by it.
     mapping(address account => bool exempt) public openingTaxExempt;
 
+    /// @notice Most tokens exempt wallets may buy, in total, while the opening
+    /// window is open. Fixed at launch.
+    /// @dev The exemption lets a team bundle its opening buys untaxed, and the
+    /// same mechanism, uncapped, would let a creator and every wallet they
+    /// declare take most of the supply at the opening price in the launch
+    /// second and sell it into everyone who arrives afterwards. The cap keeps
+    /// the legitimate use and removes that one. It binds only inside the
+    /// window; afterwards everyone trades on equal terms.
+    uint256 public openingExemptCap;
+
+    /// @notice Tokens exempt wallets have bought so far inside the window.
+    uint256 public openingExemptBought;
+
     modifier onlyFactory() {
         if (msg.sender != factory) revert NotFactory();
         _;
@@ -290,6 +306,7 @@ contract BondingCurve is ReentrancyGuard, IBondingCurve {
         openedAt = uint64(block.timestamp);
         openingTaxStartBps = IOpeningTaxTerms(factory).openingTaxStartBps();
         openingTaxWindow = IOpeningTaxTerms(factory).openingTaxWindow();
+        openingExemptCap = (supply * IOpeningTaxTerms(factory).openingExemptCapBps()) / BPS;
 
         emit Initialized(token_, supply, floor);
     }
@@ -384,6 +401,18 @@ contract BondingCurve is ReentrancyGuard, IBondingCurve {
         if (openingTaxExempt[recipient]) return 0;
         uint256 raw = FeeMath.openingTaxBps(openingTaxStartBps, block.timestamp - openedAt, openingTaxWindow);
         return _boundOpeningTax(raw);
+    }
+
+    /// @notice True while the opening tax is running.
+    function openingWindowActive() public view returns (bool) {
+        return openingTaxStartBps != 0 && block.timestamp - openedAt < openingTaxWindow;
+    }
+
+    /// @notice Tokens exempt wallets may still buy, in total, before the
+    /// opening window closes. Unlimited once it has closed.
+    function openingExemptRemaining() public view returns (uint256) {
+        if (!openingWindowActive()) return type(uint256).max;
+        return openingExemptCap > openingExemptBought ? openingExemptCap - openingExemptBought : 0;
     }
 
     /// @notice Everything a buy of `quoteIn` for `recipient` would do right now.
@@ -500,6 +529,12 @@ contract BondingCurve is ReentrancyGuard, IBondingCurve {
         }
 
         if (spent * minTokensOut > received * tokensOut) revert SlippageExceeded(tokensOut, minTokensOut);
+
+        if (openingTaxExempt[recipient] && openingWindowActive()) {
+            uint256 remaining = openingExemptRemaining();
+            if (tokensOut > remaining) revert OpeningAllocationExceeded(tokensOut, remaining);
+            openingExemptBought += tokensOut;
+        }
 
         // The opening tax joins the trade fee, so it is split and swept exactly
         // like one. What a sniper gives up flows back into the launch instead of

@@ -29,6 +29,10 @@ for (const file of files) {
   sources[file] = { content: fs.readFileSync(path.join(root, file), "utf8") };
 }
 
+// Every imported file, as the compiler saw it, so the exact input can be
+// written out for explorer verification.
+const resolved = {};
+
 function resolve(importPath) {
   const candidates = [
     path.join(root, importPath),
@@ -36,7 +40,9 @@ function resolve(importPath) {
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-      return { contents: fs.readFileSync(candidate, "utf8") };
+      const contents = fs.readFileSync(candidate, "utf8");
+      resolved[importPath] = { content: contents };
+      return { contents };
     }
   }
   return { error: `not found: ${importPath}` };
@@ -75,13 +81,30 @@ const outDir = path.join(root, "out");
 fs.rmSync(outDir, { recursive: true, force: true });
 fs.mkdirSync(outDir, { recursive: true });
 
+// The standard-JSON input that reproduces these artifacts exactly. Explorer
+// verification submits this file, so deployed bytecode can be matched against
+// source. Written only for source builds: test files are not part of what
+// gets deployed.
+if (!withTests) {
+  const { outputSelection, ...settings } = input.settings;
+  fs.writeFileSync(
+    path.join(outDir, "standard-input.json"),
+    JSON.stringify({
+      language: "Solidity",
+      sources: { ...sources, ...resolved },
+      settings: { ...settings, outputSelection: { "*": { "*": ["abi", "evm.bytecode", "evm.deployedBytecode", "metadata"] } } },
+    }),
+  );
+  fs.writeFileSync(path.join(outDir, "compiler.json"), JSON.stringify({ version: solc.version() }));
+}
+
 const LIMIT = 24576;
 const report = [];
 for (const [file, contracts] of Object.entries(output.contracts ?? {})) {
   for (const [name, artifact] of Object.entries(contracts)) {
     fs.writeFileSync(
       path.join(outDir, `${name}.json`),
-      JSON.stringify({ abi: artifact.abi, bytecode: artifact.evm.bytecode.object }),
+      JSON.stringify({ source: file, abi: artifact.abi, bytecode: artifact.evm.bytecode.object }),
     );
     const size = (artifact.evm.deployedBytecode.object?.length ?? 0) / 2;
     if (size > 0 && file.startsWith("src/")) report.push({ name, size });

@@ -110,7 +110,7 @@ contract FeeCollector is ReentrancyGuard {
         if (!isOperator && msg.sender != launch.feeRecipient) revert NotOperator();
 
         address quoteToken = _quoteToken(launch);
-        (uint256 tokenFees, uint256 quoteFees) = _collect(token, quoteToken, launch);
+        (uint256 tokenFees, uint256 quoteFees) = _collect(token, quoteToken);
         if (tokenFees == 0 && quoteFees == 0) revert NothingToCollect();
         emit FeesCollected(token, tokenFees, quoteFees);
 
@@ -147,31 +147,29 @@ contract FeeCollector is ReentrancyGuard {
         emit FeesDistributed(token, treasuryAmount, buybackAmount, creatorAmount, tokensLocked);
     }
 
-    /// @notice Fees this contract is holding for `token` but has not yet paid
-    /// out, so an interface can show a creator their true position rather than
-    /// only what has reached the escrow.
-    function pending(address token) external view returns (uint256 tokenAmount, uint256 quoteAmount) {
-        Launch memory launch = registry.getLaunch(token);
-        if (!launch.exists) return (0, 0);
-        tokenAmount = IERC20(token).balanceOf(address(this));
-        quoteAmount = IERC20(_quoteToken(launch)).balanceOf(address(this));
+    /// @notice Launch-token fees this contract is holding for `token` because
+    /// an earlier conversion was deferred. They are converted on the next call.
+    /// @dev The quote side never waits here: every call distributes all the
+    /// quote it collected or converted before returning.
+    function pendingTokenFees(address token) external view returns (uint256) {
+        if (!registry.getLaunch(token).exists) return 0;
+        return IERC20(token).balanceOf(address(this));
     }
 
-    function _collect(address token, address quoteToken, Launch memory launch)
-        private
-        returns (uint256 tokenFees, uint256 quoteFees)
-    {
-        uint256 tokenBefore = IERC20(token).balanceOf(address(this));
+    function _collect(address token, address quoteToken) private returns (uint256 tokenFees, uint256 quoteFees) {
         uint256 quoteBefore = IERC20(quoteToken).balanceOf(address(this));
 
         locker.collectFees(token);
 
-        // Measure what arrived rather than trusting the amounts reported, and
-        // read the two sides off the balances so the pool's own ordering of its
-        // assets never has to be replicated here.
-        tokenFees = IERC20(token).balanceOf(address(this)) - tokenBefore;
+        // The launch token is unique to this launch, so this contract's whole
+        // balance of it belongs to this launch. Taking the whole balance rather
+        // than what arrived just now is what retries a conversion that was
+        // deferred on an earlier call, instead of leaving it here forever.
+        tokenFees = IERC20(token).balanceOf(address(this));
+        // The quote asset is shared by every launch quoted in it, so only what
+        // arrived in this call is this launch's. Reading both sides off
+        // balances means the pool's own ordering never has to be replicated.
         quoteFees = IERC20(quoteToken).balanceOf(address(this)) - quoteBefore;
-        launch;
     }
 
     function _convert(

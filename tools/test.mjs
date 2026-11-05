@@ -53,7 +53,7 @@ const params = (overrides = {}) => ({
   ...overrides,
 });
 
-async function deployProtocol({ launchFee = 0n, openingTax = { startBps: 0, window: 5 } } = {}) {
+async function deployProtocol({ launchFee = 0n, openingTax = { startBps: 0, window: 5, exemptCapBps: 1_000 } } = {}) {
   const c = await Chainlet.create();
   for (const account of [ADMIN, TREASURY, CREATOR, TRADER, SNIPER, OTHER, OPERATOR]) {
     await c.setBalance(account, E(1_000));
@@ -62,8 +62,7 @@ async function deployProtocol({ launchFee = 0n, openingTax = { startBps: 0, wind
   const weth = await c.deploy("MockWrappedNative", [], { from: ADMIN });
   const ammFactory = await c.deploy("MockAmmFactory", [], { from: ADMIN });
   const positions = await c.deploy("MockPositionManager", [ammFactory.address], { from: ADMIN });
-  const router = await c.deploy("MockSwapRouter", [], { from: ADMIN });
-  const venue = await c.deploy("AmmV3Venue", [positions.address, router.address, weth.address], { from: ADMIN });
+  const venue = await c.deploy("AmmV3Venue", [positions.address, weth.address], { from: ADMIN });
 
   const escrow = await c.deploy("FeeEscrow", [], { from: ADMIN });
   const vault = await c.deploy("BuybackVault", [escrow.address, ADMIN], { from: ADMIN });
@@ -88,10 +87,16 @@ async function deployProtocol({ launchFee = 0n, openingTax = { startBps: 0, wind
   await c.send(factory, "setLaunchEnabled", [true], { from: ADMIN });
   await c.send(factory, "setFeeSweepOperator", [OPERATOR], { from: ADMIN });
   if (openingTax) {
-    await c.send(factory, "setOpeningTax", [openingTax.startBps, openingTax.window], { from: ADMIN });
+    await c.send(
+      factory,
+      "setOpeningTax",
+      [openingTax.startBps, openingTax.window, openingTax.exemptCapBps ?? 1_000],
+      { from: ADMIN },
+    );
   }
+  const lens = await c.deploy("LaunchLens", [factory.address], { from: ADMIN });
 
-  return { c, weth, ammFactory, positions, router, venue, escrow, vault, locker, factory, deployer, collector };
+  return { c, weth, ammFactory, positions, venue, escrow, vault, locker, factory, deployer, collector, lens };
 }
 
 /** Creates a launch and returns handles for its token and curve. */
@@ -177,7 +182,8 @@ test("lifecycle: a launch mints to its curve, trades, graduates and locks liquid
   assert((await c.call(locker, "lockedSupply", [token.address])) > 0n, "excess supply locked");
 
   // Every token is accounted for: circulating, in the pool, or locked.
-  const held = await c.call(token, "balanceOf", [positions.address]);
+  const pool = await c.call(env.venue, "poolFor", [token.address, ZERO, CONFIG.venueFee]);
+  const held = await c.call(token, "balanceOf", [pool]);
   const locked = await c.call(locker, "lockedSupply", [token.address]);
   const traderBalance = await c.call(token, "balanceOf", [TRADER]);
   assertClose(held + locked + traderBalance, CONFIG.supply, E(1), "supply conserved");
@@ -231,7 +237,7 @@ test("quoting: quoteSell predicts exactly what sell settles", async () => {
 });
 
 test("opening tax: decays from near-total to nothing, and never touches the creator", async () => {
-  const env = await deployProtocol({ openingTax: { startBps: 9_900, window: 5 } });
+  const env = await deployProtocol({ openingTax: { startBps: 9_900, window: 5, exemptCapBps: 1_000 } });
   const { c } = env;
   const { curve } = await createLaunch(env);
 
@@ -259,7 +265,7 @@ test("opening tax: decays from near-total to nothing, and never touches the crea
 });
 
 test("opening tax: exemptions are fixed at creation and cannot be added later", async () => {
-  const env = await deployProtocol({ openingTax: { startBps: 9_900, window: 5 } });
+  const env = await deployProtocol({ openingTax: { startBps: 9_900, window: 5, exemptCapBps: 1_000 } });
   const { c, factory } = env;
 
   const { logs } = await c.send(
@@ -701,7 +707,7 @@ test("router: creating and buying in one transaction leaves no gap to front-run"
 
 test("post-graduation: pool fees are converted to the quote asset before they are split", async () => {
   const env = await deployProtocol();
-  const { c, factory, positions, router, weth, escrow, collector, locker } = env;
+  const { c, factory, positions, weth, escrow, collector, locker } = env;
   const { token, curve } = await createLaunch(env);
   await buyOutCurve(env, curve);
 
@@ -721,11 +727,7 @@ test("post-graduation: pool fees are converted to the quote asset before they ar
   const amount1 = tokenIsFirst ? quoteFees : tokenFees;
   await c.send(positions, "accrueFees", [positionId, amount0, amount1], { from: ADMIN });
 
-  // One launch token converts to a little quote asset.
-  await c.send(router, "setRate", [token.address, weth.address, 10n ** 13n], { from: ADMIN });
-  await c.send(weth, "deposit", [], { from: ADMIN, value: E(5) });
-  await c.send(weth, "transfer", [router.address, E(5)], { from: ADMIN });
-
+  // The launch-token side is sold into the graduated pool itself.
   // A conversion is price-sensitive, so the creator cannot run it themselves.
   await c.expectRevert(c.send(collector, "collect", [token.address, 1, 0], { from: CREATOR }), "OperatorRequired");
 
@@ -825,12 +827,18 @@ test("registry: launches are enumerable from the chain alone", async () => {
   assertEqual((await c.call(factory, "launchAt", [0])).toLowerCase(), first.token.address, "first by index");
   assertEqual((await c.call(factory, "launchAt", [1])).toLowerCase(), second.token.address, "second by index");
 
-  const byCreator = await c.call(factory, "launchesOf", [CREATOR]);
+  assertEqual(await c.call(factory, "launchCountOf", [CREATOR]), 1n, "one launch for this creator");
+  const byCreator = await c.call(env.lens, "launchesOf", [CREATOR, 0, 10]);
   assertEqual(byCreator.length, 1, "one launch for this creator");
   assertEqual(byCreator[0].toLowerCase(), first.token.address, "and it is theirs");
 
-  const page = await c.call(factory, "launchesPaged", [1, 10]);
+  const page = await c.call(env.lens, "launches", [1, 10]);
   assertEqual(page.length, 1, "paging past the end stops at the end");
+  assertEqual((await c.call(env.lens, "launches", [5, 10])).length, 0, "an offset past the end is empty");
+
+  const view = await c.call(env.lens, "launchView", [first.token.address, TRADER]);
+  assertEqual(view.launch.token, first.token.address, "the lens reads the record");
+  assert(view.sellableTokens > 0n, "and the curve's live figures");
 });
 
 test("access: launching is gated, and the gate cannot reach a live launch", async () => {
@@ -907,6 +915,344 @@ test("safety: donations to a curve cannot move its price or its graduation", asy
   const reserves = await c.call(curve, "reserves");
   const tracked = await c.call(curve, "trackedTokens");
   assertEqual(reserves[1], tracked, "a token donation does not move the token reserve");
+});
+
+// --- Graduation into a pool someone else prepared --------------------------
+
+const Q192 = 1n << 192n;
+
+function isqrt(n) {
+  if (n < 2n) return n;
+  let x = n;
+  let y = (x + 1n) >> 1n;
+  while (y < x) {
+    x = y;
+    y = (x + n / x) >> 1n;
+  }
+  return x;
+}
+
+/** The sqrt-price the venue derives from a seed, in the pool's own ordering. */
+function seedPrice(token, quoteToken, tokenAmount, quoteAmount) {
+  const tokenIsFirst = token.toLowerCase() < quoteToken.toLowerCase();
+  const [a0, a1] = tokenIsFirst ? [tokenAmount, quoteAmount] : [quoteAmount, tokenAmount];
+  return isqrt((a1 * Q192) / a0);
+}
+
+/** The seed this configuration graduates with, before fees move it slightly. */
+function expectedSeed() {
+  const floor = (CONFIG.supply * CONFIG.virtualQuote) / (CONFIG.virtualQuote + CONFIG.graduationTarget);
+  const tokens = (floor * CONFIG.graduationTarget) / (CONFIG.graduationTarget + CONFIG.virtualQuote);
+  return { tokens, quote: CONFIG.graduationTarget };
+}
+
+/** Buys a curve out and returns the logs of the buy that finished it. */
+async function buyOutReturningLogs(env, curve, buyer = TRADER) {
+  const { c } = env;
+  let last = [];
+  for (let i = 0; i < 40; i++) {
+    if ((await c.call(curve, "sellableTokens")) === 0n) break;
+    ({ logs: last } = await c.send(curve, "buy", [E(2), 0, buyer], { from: buyer, value: E(2) }));
+  }
+  return last;
+}
+
+async function poolHandle(env, token) {
+  const address = await env.c.call(env.venue, "poolFor", [token.address, ZERO, CONFIG.venueFee]);
+  return { name: "MockPool", address: address.toLowerCase() };
+}
+
+test("pool hijack: a pool initialized empty at a false price is restored before liquidity goes in", async () => {
+  const env = await deployProtocol();
+  const { c, ammFactory, weth, factory, locker } = env;
+  const { token, curve } = await createLaunch(env);
+
+  // The token address is public from creation, so an attacker creates its
+  // pool first and sets a price nine times wrong.
+  const seed = expectedSeed();
+  const fair = seedPrice(token.address, weth.address, seed.tokens, seed.quote);
+  const falsePrice = fair * 3n;
+  await c.send(ammFactory, "createPool", [token.address, weth.address, CONFIG.venueFee], { from: SNIPER });
+  const pool = await poolHandle(env, token);
+  await c.send(pool, "initialize", [falsePrice], { from: SNIPER });
+  assertEqual(await c.call(pool, "sqrtPriceX96"), falsePrice, "attacker's price is in place");
+
+  const logs = await buyOutReturningLogs(env, curve);
+
+  const record = await c.call(factory, "getLaunch", [token.address]);
+  assertEqual(record.phase, 2, "graduated and listed despite the prepared pool");
+  assert(await c.call(locker, "isLocked", [token.address]), "position locked");
+
+  const [listed] = c.eventsFrom(logs, "LaunchFactory", "LaunchListed");
+  const target = seedPrice(token.address, weth.address, listed.tokenAmount, listed.quoteAmount);
+  const [restored] = c.eventsFrom(logs, "AmmV3Venue", "PoolPriceRestored");
+  assertEqual(restored.from, falsePrice, "the venue saw the false price");
+  assertEqual(restored.to, target, "and moved it to the curve's own price");
+  assertEqual(await c.call(pool, "sqrtPriceX96"), target, "the pool opened at the price the curve finished at");
+});
+
+test("pool hijack: an attacker's own liquidity at a false price is traded back, at their expense", async () => {
+  const env = await deployProtocol();
+  const { c, ammFactory, positions, weth, factory } = env;
+  const { token, curve } = await createLaunch(env);
+
+  // The attacker buys some of the token, wraps some value, and seeds the
+  // pool themselves at a price nine times wrong.
+  await c.send(curve, "buy", [E(1) / 2n, 0, SNIPER], { from: SNIPER, value: E(1) / 2n });
+  await c.send(weth, "deposit", [], { from: SNIPER, value: E(1) / 5n });
+
+  const seed = expectedSeed();
+  const fair = seedPrice(token.address, weth.address, seed.tokens, seed.quote);
+  const falsePrice = fair * 3n;
+  await c.send(ammFactory, "createPool", [token.address, weth.address, CONFIG.venueFee], { from: SNIPER });
+  const pool = await poolHandle(env, token);
+  await c.send(pool, "initialize", [falsePrice], { from: SNIPER });
+
+  const attackerTokens = await c.call(token, "balanceOf", [SNIPER]);
+  const attackerWeth = await c.call(weth, "balanceOf", [SNIPER]);
+  await c.send(token, "approve", [positions.address, attackerTokens], { from: SNIPER });
+  await c.send(weth, "approve", [positions.address, attackerWeth], { from: SNIPER });
+  const tokenIsFirst = token.address < weth.address.toLowerCase();
+  const [token0, token1] = tokenIsFirst ? [token.address, weth.address] : [weth.address, token.address];
+  const [a0, a1] = tokenIsFirst ? [attackerTokens, attackerWeth] : [attackerWeth, attackerTokens];
+  await c.send(
+    positions,
+    "mint",
+    [{
+      token0, token1, fee: CONFIG.venueFee, tickLower: -887200, tickUpper: 887200,
+      amount0Desired: a0, amount1Desired: a1, amount0Min: 0, amount1Min: 0,
+      recipient: SNIPER, deadline: c.now + 1000n,
+    }],
+    { from: SNIPER },
+  );
+  const attackerLiquidity = await c.call(pool, "liquidity");
+  assert(attackerLiquidity > 0n, "the attacker has liquidity in the pool");
+
+  const logs = await buyOutReturningLogs(env, curve);
+
+  assertEqual((await c.call(factory, "getLaunch", [token.address])).phase, 2, "listed");
+  const [listed] = c.eventsFrom(logs, "LaunchFactory", "LaunchListed");
+  const target = seedPrice(token.address, weth.address, listed.tokenAmount, listed.quoteAmount);
+  assertEqual(await c.call(pool, "sqrtPriceX96"), target, "restored to the curve's price before minting");
+  assert((await c.call(pool, "liquidity")) > attackerLiquidity, "the launch's liquidity went in on top");
+
+  // Nothing the listing did not use is left sitting in the factory.
+  assertEqual(await c.call(token, "balanceOf", [factory.address]), 0n, "no launch tokens stranded in the factory");
+  assertEqual(await c.call(weth, "balanceOf", [factory.address]), 0n, "no wrapped quote stranded in the factory");
+  assertEqual(await c.balanceOf(factory.address), 0n, "no native quote stranded in the factory");
+});
+
+test("pool hijack: the remainder of a listing is locked or credited, never stranded", async () => {
+  const env = await deployProtocol();
+  const { c, factory, weth, locker, escrow } = env;
+  const { token, curve } = await createLaunch(env);
+
+  const floor = await c.call(curve, "reserveFloor");
+  const logs = await buyOutReturningLogs(env, curve);
+  const [listed] = c.eventsFrom(logs, "LaunchFactory", "LaunchListed");
+
+  // Supply that missed the pool, at graduation or as rounding from the mint,
+  // is all locked; none of it is held anywhere it could leave from.
+  const pool = await poolHandle(env, token);
+  const inPool = await c.call(token, "balanceOf", [pool.address]);
+  const locked = await c.call(locker, "lockedSupply", [token.address]);
+  assertEqual(inPool + locked, floor, "every reserved token is in the pool or locked");
+  assertEqual(await c.call(token, "balanceOf", [factory.address]), 0n, "none left in the factory");
+  assertEqual(await c.balanceOf(factory.address), 0n, "no native value left in the factory");
+  assertEqual(await c.call(weth, "balanceOf", [factory.address]), 0n, "no wrapped value left in the factory");
+
+  const remainder = c.eventsFrom(logs, "LaunchFactory", "ListingRemainderHandled");
+  if (remainder.length > 0 && remainder[0].quoteToTreasury > 0n) {
+    assert((await c.call(escrow, "balanceOf", [TREASURY])) >= remainder[0].quoteToTreasury, "quote remainder credited");
+  }
+  assert(listed.tokenAmount > 0n, "the pool was seeded");
+});
+
+test("configuration: a fee tier paired with the wrong tick spacing is refused when added", async () => {
+  const env = await deployProtocol();
+  const { c, factory } = env;
+
+  await c.expectRevert(
+    c.send(factory, "addLaunchConfig", [{ ...CONFIG, venueFee: 3_000, tickSpacing: 200 }], { from: ADMIN }),
+    "FeeTierMismatch",
+  );
+  await c.expectRevert(
+    c.send(factory, "addLaunchConfig", [{ ...CONFIG, venueFee: 1_234, tickSpacing: 200 }], { from: ADMIN }),
+    "FeeTierMismatch",
+  );
+  await c.send(factory, "addLaunchConfig", [{ ...CONFIG, venueFee: 3_000, tickSpacing: 60 }], { from: ADMIN });
+});
+
+test("post-graduation: a conversion deferred by a failing pool is retried on the next call", async () => {
+  const env = await deployProtocol();
+  const { c, positions, weth, escrow, collector, locker } = env;
+  const { token, curve } = await createLaunch(env);
+  await buyOutCurve(env, curve);
+
+  const [positionId] = await c.call(locker, "positionOf", [token.address]);
+  const tokenFees = E(50_000);
+  const quoteFees = E(1) / 10n;
+  await c.send(token, "transfer", [ADMIN, tokenFees], { from: TRADER });
+  await c.send(weth, "deposit", [], { from: ADMIN, value: quoteFees });
+  await c.send(token, "approve", [positions.address, tokenFees], { from: ADMIN });
+  await c.send(weth, "approve", [positions.address, quoteFees], { from: ADMIN });
+  const tokenIsFirst = token.address < weth.address.toLowerCase();
+  await c.send(
+    positions,
+    "accrueFees",
+    [positionId, tokenIsFirst ? tokenFees : quoteFees, tokenIsFirst ? quoteFees : tokenFees],
+    { from: ADMIN },
+  );
+
+  const pool = await poolHandle(env, token);
+  await c.send(pool, "setSwapReverts", [true], { from: ADMIN });
+  const { logs } = await c.send(collector, "collect", [token.address, 1, 0], { from: OPERATOR });
+  assertEqual(c.eventsFrom(logs, "FeeCollector", "ConversionSkipped").length, 1, "the conversion was deferred");
+  assertEqual(await c.call(collector, "pendingTokenFees", [token.address]), tokenFees, "and its tokens are held");
+  const creatorAfterFirst = await c.call(escrow, "balanceOf", [CREATOR]);
+  assert(creatorAfterFirst > 0n, "the quote side was paid out regardless");
+
+  await c.send(pool, "setSwapReverts", [false], { from: ADMIN });
+  await c.send(collector, "collect", [token.address, 1, 0], { from: OPERATOR });
+  assertEqual(await c.call(collector, "pendingTokenFees", [token.address]), 0n, "the deferred tokens converted");
+  assert((await c.call(escrow, "balanceOf", [CREATOR])) > creatorAfterFirst, "and were paid out");
+});
+
+test("opening tax: exempt wallets cannot take more than their share before the window closes", async () => {
+  const env = await deployProtocol({ openingTax: { startBps: 9_900, window: 5, exemptCapBps: 1_000 } });
+  const { c } = env;
+  const { curve } = await createLaunch(env);
+
+  const cap = await c.call(curve, "openingExemptCap");
+  assertEqual(cap, CONFIG.supply / 10n, "ten percent of supply");
+
+  // The creator is exempt from the tax, so their buy clears untaxed, but only
+  // up to the cap while the window is open.
+  await c.send(curve, "buy", [E(1) / 10n, 0, CREATOR], { from: CREATOR, value: E(1) / 10n });
+  const remaining = await c.call(curve, "openingExemptRemaining");
+  assert(remaining > 0n && remaining < cap, "part of the allowance used");
+  await c.expectRevert(
+    c.send(curve, "buy", [E(1) / 2n, 0, CREATOR], { from: CREATOR, value: E(1) / 2n }),
+    "OpeningAllocationExceeded",
+  );
+
+  // Once the window closes everyone trades on equal terms.
+  c.warp(6);
+  assert(!(await c.call(curve, "openingWindowActive")), "window closed");
+  await c.send(curve, "buy", [E(1) / 2n, 0, CREATOR], { from: CREATOR, value: E(1) / 2n });
+});
+
+test("escrow: a recipient that cannot receive native value can still claim to another address", async () => {
+  const env = await deployProtocol();
+  const { c, escrow } = env;
+  const { curve } = await createLaunch(env);
+
+  const rejecting = await c.deploy("RejectingRecipient", [], { from: ADMIN });
+  await c.send(env.factory, "transferFeeRecipient", [await c.call(curve, "token"), rejecting.address], {
+    from: CREATOR,
+  });
+  await c.send(curve, "buy", [E(1), 0, TRADER], { from: TRADER, value: E(1) });
+  await c.send(curve, "sweepFees", [0], { from: OPERATOR });
+
+  const owed = await c.call(escrow, "balanceOf", [rejecting.address]);
+  assert(owed > 0n, "credited");
+
+  const before = await c.balanceOf(OTHER);
+  const data = c.iface("FeeEscrow").encodeFunctionData("claimTo", [OTHER, owed]);
+  await c.send(rejecting, "call", [escrow.address, data], { from: ADMIN });
+  assertEqual(await c.balanceOf(OTHER), before + owed, "paid to the address it named");
+  assertEqual(await c.call(escrow, "balanceOf", [rejecting.address]), 0n, "and debited from its own balance");
+});
+
+test("liquidity: the locker refuses positions sent to it by transfer", async () => {
+  const env = await deployProtocol();
+  const { c, locker } = env;
+  await c.expectRevert(
+    c.send(locker, "onERC721Received", [OTHER, OTHER, 1, "0x"], { from: OTHER }),
+    "UnexpectedTransfer",
+  );
+});
+
+// --- Randomised invariants --------------------------------------------------
+
+function prng(seed) {
+  let x = BigInt(seed) * 0x9e3779b97f4a7c15n;
+  const mask = (1n << 64n) - 1n;
+  return () => {
+    x = (x * 6364136223846793005n + 1442695040888963407n) & mask;
+    return x >> 16n;
+  };
+}
+
+test("invariants: random trading keeps every curve solvent and every quote exact", async () => {
+  for (const seed of [1, 2, 3, 4]) {
+    const env = await deployProtocol();
+    const { c, vault } = env;
+    const { token, curve } = await createLaunch(env, {
+      creatorFeeBps: 250,
+      buybackEnabled: true,
+      salt: "0x" + seed.toString(16).padStart(64, "0"),
+    });
+    const traders = [TRADER, OTHER, SNIPER];
+    const next = prng(seed);
+
+    const checkInvariants = async (where) => {
+      if (await c.call(curve, "settled")) return;
+      const tracked = await c.call(curve, "trackedQuote");
+      const pendingFees = (await c.call(curve, "feeBalance")) + (await c.call(curve, "creatorFeeBalance"));
+      assert((await c.balanceOf(curve.address)) >= tracked, `${where}: curve holds what it tracks`);
+      assert(tracked >= pendingFees, `${where}: tracked quote covers pending fees`);
+
+      let held = (await c.call(token, "balanceOf", [curve.address])) + (await c.call(token, "balanceOf", [vault.address]));
+      for (const trader of traders) held += await c.call(token, "balanceOf", [trader]);
+      assertEqual(held, CONFIG.supply, `${where}: every token accounted for`);
+      assertEqual(
+        await c.call(token, "balanceOf", [curve.address]),
+        await c.call(curve, "trackedTokens"),
+        `${where}: the curve's tracked tokens match its balance`,
+      );
+    };
+
+    for (let step = 0; step < 40; step++) {
+      if (await c.call(curve, "settled")) break;
+      const who = traders[Number(next() % 3n)];
+      const action = next() % 10n;
+      const where = `seed ${seed} step ${step}`;
+
+      if (action < 6n) {
+        const amount = (next() % (E(1) / 2n)) + 10n ** 15n;
+        const quoted = await c.call(curve, "quoteBuy", [amount, who]);
+        const { logs } = await c.send(curve, "buy", [amount, 0, who], { from: who, value: amount });
+        const [bought] = c.eventsFrom(logs, "BondingCurve", "Buy");
+        assertEqual(bought.tokensOut, quoted[0], `${where}: buy matches its quote`);
+        assertEqual(bought.quoteIn, quoted[1], `${where}: spend matches its quote`);
+      } else if (action < 9n) {
+        if (await c.call(curve, "readyToGraduate")) continue;
+        const balance = await c.call(token, "balanceOf", [who]);
+        if (balance === 0n) continue;
+        const amount = (balance * ((next() % 100n) + 1n)) / 100n;
+        const quoted = await c.call(curve, "quoteSell", [amount]);
+        await c.send(token, "approve", [curve.address, amount], { from: who });
+        const { logs } = await c.send(curve, "sell", [amount, 0, who], { from: who });
+        const [sold] = c.eventsFrom(logs, "BondingCurve", "Sell");
+        assertEqual(sold.quoteOut, quoted[0], `${where}: sell matches its quote`);
+      } else {
+        await c.send(curve, "sweepFees", [1], { from: OPERATOR });
+      }
+      await checkInvariants(where);
+    }
+
+    // Unwind: while the curve is open, everyone can always sell everything back.
+    if (!(await c.call(curve, "settled")) && !(await c.call(curve, "readyToGraduate"))) {
+      for (const trader of traders) {
+        const balance = await c.call(token, "balanceOf", [trader]);
+        if (balance === 0n) continue;
+        await c.send(token, "approve", [curve.address, balance], { from: trader });
+        await c.send(curve, "sell", [balance, 0, trader], { from: trader });
+      }
+      await checkInvariants(`seed ${seed} unwind`);
+    }
+  }
 });
 
 // --- Runner -----------------------------------------------------------------

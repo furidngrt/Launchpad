@@ -6,7 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-import {IAmmFactory, IPositionManager, IPositionFees, ISwapRouter} from "../../src/interfaces/IAmmV3.sol";
+import {IAmmFactory, IPositionManager, IPositionFees} from "../../src/interfaces/IAmmV3.sol";
 
 /// @notice Plain mintable ERC-20 standing in for a quote asset.
 contract MockERC20 is ERC20 {
@@ -68,16 +68,151 @@ contract MockWrappedNative is ERC20 {
     }
 }
 
-/// @notice Records which pool address belongs to a pair.
+interface ISwapCallback {
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external;
+}
+
+/// @notice A concentrated-liquidity pool reduced to a single full range.
+/// @dev Faithful to what the venue depends on: anyone may initialize it once at
+/// any price; a swap through zero liquidity moves the price to the limit
+/// without exchanging anything; with liquidity, the price moves along the
+/// constant-product curve `x = L / sqrtP`, `y = L * sqrtP`; output is sent
+/// before the callback and payment is checked after it.
+contract MockPool {
+    using SafeERC20 for IERC20;
+
+    uint256 private constant Q96 = 1 << 96;
+
+    address public immutable token0;
+    address public immutable token1;
+    uint24 public immutable fee;
+    address public immutable manager;
+
+    uint160 public sqrtPriceX96;
+    uint128 public liquidity;
+    bool public swapReverts;
+
+    constructor(address token0_, address token1_, uint24 fee_, address manager_) {
+        token0 = token0_;
+        token1 = token1_;
+        fee = fee_;
+        manager = manager_;
+    }
+
+    function initialize(uint160 price) external {
+        require(sqrtPriceX96 == 0, "already initialized");
+        sqrtPriceX96 = price;
+    }
+
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (sqrtPriceX96, 0, 0, 0, 0, 0, true);
+    }
+
+    function setSwapReverts(bool value) external {
+        swapReverts = value;
+    }
+
+    /// @dev Only the position manager adds liquidity, after taking the tokens.
+    function addLiquidity(uint128 amount) external {
+        require(msg.sender == manager, "not manager");
+        liquidity += amount;
+    }
+
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 limit, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1)
+    {
+        require(!swapReverts, "swap reverts");
+        require(sqrtPriceX96 != 0, "not initialized");
+        require(amountSpecified > 0, "exact input only");
+        uint256 amountIn = uint256(amountSpecified);
+        uint160 price = sqrtPriceX96;
+        uint256 L = liquidity;
+
+        uint256 used;
+        uint256 out;
+        uint160 next;
+
+        if (zeroForOne) {
+            require(limit < price, "bad limit");
+            if (L == 0) {
+                next = limit;
+            } else {
+                next = uint160(Math.mulDiv(L * Q96, price, L * Q96 + amountIn * price));
+                // As in the real pool, an exact-input swap that does not reach
+                // its limit consumes the whole input; rounding favours the pool.
+                used = amountIn;
+                if (next < limit) {
+                    next = limit;
+                    used = Math.mulDiv(L, Q96, next) - Math.mulDiv(L, Q96, price);
+                    if (used > amountIn) used = amountIn;
+                }
+                out = Math.mulDiv(L, price - next, Q96);
+            }
+            amount0 = int256(used);
+            amount1 = -int256(out);
+        } else {
+            require(limit > price, "bad limit");
+            if (L == 0) {
+                next = limit;
+            } else {
+                next = uint160(uint256(price) + Math.mulDiv(amountIn, Q96, L));
+                used = amountIn;
+                if (next > limit) {
+                    next = limit;
+                    used = Math.mulDiv(L, next - price, Q96);
+                    if (used > amountIn) used = amountIn;
+                }
+                out = Math.mulDiv(L, Q96, price) - Math.mulDiv(L, Q96, next);
+            }
+            amount0 = -int256(out);
+            amount1 = int256(used);
+        }
+
+        sqrtPriceX96 = next;
+
+        address tokenIn = zeroForOne ? token0 : token1;
+        address tokenOut = zeroForOne ? token1 : token0;
+        if (out != 0) IERC20(tokenOut).safeTransfer(recipient, out);
+
+        uint256 before = IERC20(tokenIn).balanceOf(address(this));
+        ISwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+        require(IERC20(tokenIn).balanceOf(address(this)) >= before + used, "underpaid");
+    }
+}
+
+/// @notice Registry of pools and the tick spacing each fee tier enforces.
 contract MockAmmFactory is IAmmFactory {
     mapping(bytes32 => address) private _pools;
+    mapping(uint24 => int24) public feeAmountTickSpacing;
+
+    constructor() {
+        feeAmountTickSpacing[100] = 1;
+        feeAmountTickSpacing[500] = 10;
+        feeAmountTickSpacing[3000] = 60;
+        feeAmountTickSpacing[10000] = 200;
+    }
 
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address) {
         return _pools[_key(tokenA, tokenB, fee)];
     }
 
-    function setPool(address tokenA, address tokenB, uint24 fee, address pool) external {
-        _pools[_key(tokenA, tokenB, fee)] = pool;
+    /// @dev Open to anyone, exactly like the real thing. That openness is the
+    /// hazard the venue has to handle.
+    function createPool(address tokenA, address tokenB, uint24 fee) public returns (address pool) {
+        require(feeAmountTickSpacing[fee] != 0, "fee not enabled");
+        bytes32 key = _key(tokenA, tokenB, fee);
+        require(_pools[key] == address(0), "exists");
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        pool = address(new MockPool(token0, token1, fee, manager));
+        _pools[key] = pool;
+    }
+
+    address public manager;
+
+    function setManager(address manager_) external {
+        require(manager == address(0), "set");
+        manager = manager_;
     }
 
     function _key(address tokenA, address tokenB, uint24 fee) private pure returns (bytes32) {
@@ -86,11 +221,13 @@ contract MockAmmFactory is IAmmFactory {
     }
 }
 
-/// @notice Stands in for the AMM's position manager. It takes both sides of a
-/// seed, hands the position to the recipient, and can be told to owe fees so
-/// the post-graduation split can be exercised.
+/// @notice Stands in for the AMM's position manager over `MockPool`. Mints
+/// full-range liquidity at the pool's current price, and can be told to owe
+/// fees so the post-graduation split can be exercised.
 contract MockPositionManager is IPositionManager, IPositionFees {
     using SafeERC20 for IERC20;
+
+    uint256 private constant Q96 = 1 << 96;
 
     struct Info {
         address token0;
@@ -110,10 +247,10 @@ contract MockPositionManager is IPositionManager, IPositionFees {
 
     mapping(uint256 => address) public ownerOf;
     mapping(uint256 => Info) public info;
-    mapping(bytes32 => uint160) public initializedAt;
 
     constructor(address factory_) {
         factory = factory_;
+        MockAmmFactory(factory_).setManager(address(this));
     }
 
     function setMintReverts(bool value) external {
@@ -125,10 +262,10 @@ contract MockPositionManager is IPositionManager, IPositionFees {
         payable
         returns (address pool)
     {
-        bytes32 key = keccak256(abi.encode(token0, token1, fee));
-        if (initializedAt[key] == 0) initializedAt[key] = sqrtPriceX96;
-        pool = address(uint160(uint256(key)));
-        MockAmmFactory(factory).setPool(token0, token1, fee, pool);
+        pool = MockAmmFactory(factory).getPool(token0, token1, fee);
+        if (pool == address(0)) pool = MockAmmFactory(factory).createPool(token0, token1, fee);
+        // Like the real manager: an existing, initialized pool keeps its price.
+        if (MockPool(pool).sqrtPriceX96() == 0) MockPool(pool).initialize(sqrtPriceX96);
     }
 
     function mint(MintParams calldata params)
@@ -137,16 +274,29 @@ contract MockPositionManager is IPositionManager, IPositionFees {
         returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)
     {
         require(!mintReverts, "mint reverts");
+        address pool = MockAmmFactory(factory).getPool(params.token0, params.token1, params.fee);
+        require(pool != address(0), "no pool");
+        uint160 price = MockPool(pool).sqrtPriceX96();
+        require(price != 0, "not initialized");
 
-        // Leave a little of each side untaken, the way a real mint rounds, so
-        // the dust path is exercised.
-        amount0 = params.amount0Desired - (params.amount0Desired % 7);
-        amount1 = params.amount1Desired - (params.amount1Desired % 7);
+        // Full-range liquidity is limited by whichever side is scarcer at the
+        // current price; the other side's excess is left with the caller.
+        uint256 fromAmount0 = Math.mulDiv(params.amount0Desired, price, Q96);
+        uint256 fromAmount1 = Math.mulDiv(params.amount1Desired, Q96, price);
+        uint256 L = Math.min(fromAmount0, fromAmount1);
+        require(L > 0 && L <= type(uint128).max, "no liquidity");
 
-        IERC20(params.token0).safeTransferFrom(msg.sender, address(this), amount0);
-        IERC20(params.token1).safeTransferFrom(msg.sender, address(this), amount1);
+        amount0 = Math.mulDiv(L, Q96, price);
+        amount1 = Math.mulDiv(L, price, Q96);
+        if (amount0 > params.amount0Desired) amount0 = params.amount0Desired;
+        if (amount1 > params.amount1Desired) amount1 = params.amount1Desired;
+        require(amount0 >= params.amount0Min && amount1 >= params.amount1Min, "slippage");
 
-        liquidity = uint128(Math.sqrt(amount0 * amount1));
+        IERC20(params.token0).safeTransferFrom(msg.sender, pool, amount0);
+        IERC20(params.token1).safeTransferFrom(msg.sender, pool, amount1);
+        liquidity = uint128(L);
+        MockPool(pool).addLiquidity(liquidity);
+
         tokenId = nextTokenId++;
         ownerOf[tokenId] = params.recipient;
         info[tokenId] = Info({
@@ -182,57 +332,6 @@ contract MockPositionManager is IPositionManager, IPositionFees {
         if (amount0 != 0) IERC20(position.token0).safeTransfer(params.recipient, amount0);
         if (amount1 != 0) IERC20(position.token1).safeTransfer(params.recipient, amount1);
     }
-
-    function positions(uint256 tokenId)
-        external
-        view
-        returns (uint96, address, address, address, uint24, int24, int24, uint128, uint256, uint256, uint128, uint128)
-    {
-        Info memory position = info[tokenId];
-        return (
-            0,
-            address(0),
-            position.token0,
-            position.token1,
-            position.fee,
-            position.tickLower,
-            position.tickUpper,
-            position.liquidity,
-            0,
-            0,
-            position.owed0,
-            position.owed1
-        );
-    }
-}
-
-/// @notice Swaps at a rate the test sets, paying out of its own balance and
-/// honouring the caller's minimum.
-contract MockSwapRouter is ISwapRouter {
-    using SafeERC20 for IERC20;
-
-    /// @dev Output per unit of input, scaled by 1e18.
-    mapping(address => mapping(address => uint256)) public rate;
-    bool public swapReverts;
-
-    function setRate(address tokenIn, address tokenOut, uint256 rate_) external {
-        rate[tokenIn][tokenOut] = rate_;
-    }
-
-    function setSwapReverts(bool value) external {
-        swapReverts = value;
-    }
-
-    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut) {
-        require(!swapReverts, "swap reverts");
-        uint256 configured = rate[params.tokenIn][params.tokenOut];
-        require(configured != 0, "no rate");
-
-        IERC20(params.tokenIn).safeTransferFrom(msg.sender, address(this), params.amountIn);
-        amountOut = (params.amountIn * configured) / 1e18;
-        require(amountOut >= params.amountOutMinimum, "Too little received");
-        IERC20(params.tokenOut).safeTransfer(params.recipient, amountOut);
-    }
 }
 
 /// @notice A recipient that refuses native value, used to show that one
@@ -240,5 +339,12 @@ contract MockSwapRouter is ISwapRouter {
 contract RejectingRecipient {
     receive() external payable {
         revert("no thanks");
+    }
+
+    /// @notice Lets the test act as this contract to claim elsewhere.
+    function call(address target, bytes calldata data) external returns (bytes memory) {
+        (bool ok, bytes memory result) = target.call(data);
+        require(ok, "call failed");
+        return result;
     }
 }

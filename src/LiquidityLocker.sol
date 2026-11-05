@@ -35,6 +35,7 @@ contract LiquidityLocker is ILiquidityLocker, IERC721Receiver {
     error ZeroAddress();
     error AlreadyLocked();
     error PositionNotHeld();
+    error UnexpectedTransfer();
 
     event FactorySet(address factory);
     event PositionLocked(address indexed token, uint256 indexed positionId, address venue);
@@ -141,12 +142,14 @@ contract LiquidityLocker is ILiquidityLocker, IERC721Receiver {
         return _positions[token].locked;
     }
 
-    /// @notice Accepts a position transferred in by its own registry.
-    /// @dev Not part of the graduation path, which has the venue mint straight
-    /// to this address. It exists so an explicit transfer still behaves, and
-    /// only from a venue's own registry.
+    /// @notice Refuses every safe transfer.
+    /// @dev Not part of the graduation path: the venue mints the position
+    /// straight to this address, and a mint fires no receiver callback. Nothing
+    /// should ever be transferred in, so anything that arrives this way is a
+    /// mistake, and bouncing it is better than holding it forever where no
+    /// function could ever return it.
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
-        return IERC721Receiver.onERC721Received.selector;
+        revert UnexpectedTransfer();
     }
 
     function _positionRegistry(address venue) private view returns (address) {
