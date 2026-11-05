@@ -22,6 +22,7 @@ There is no pre-allocation for the creator, no mint function on the launch token
 - [Recovery paths](#recovery-paths)
 - [Integration](#integration)
 - [Build, test, deploy](#build-test-deploy)
+- [Web app](#web-app)
 - [Deployments](#deployments)
 - [Design notes](#design-notes)
 - [Known limitations](#known-limitations)
@@ -399,6 +400,41 @@ NETWORK=sepolia RPC_URL=... PRIVATE_KEY=... node tools/smoke.mjs
 ```
 
 The smoke test creates a launch on the cheap configuration, sabotages its pool the way an attacker would, buys the curve out, and confirms the launch listed at the curve's own price with its liquidity locked. In environments that reach the network through an HTTP proxy, set `NODE_USE_ENV_PROXY=1` so Node routes through it.
+
+## Web app
+
+`web/` is the trading interface: a Vite + React single-page app with wagmi and viem for wallets and reads, and [TradingView Lightweight Charts](https://github.com/tradingview/lightweight-charts) for price charts. It needs no backend and no indexer. Launch lists come from `LaunchLens`, curve state from batched multicall reads, and trade history and candles are rebuilt in the browser from the curve's own events.
+
+Pages:
+
+- **Tokens**: top launches, then every launch as a grid or a list, filterable by top, new, near graduation and graduated, with search by name, symbol or address.
+- **Token**: candles or line chart from 1m to 4h, trades, details, buy and sell with slippage control, curve progress, and the finishing transaction for a launch that is ready to graduate. After graduation the panel links to the locked Uniswap pool.
+- **Create**: name, image and links, curve terms, creator fee, buyback toggle and an optional opening buy in the same transaction. The economics are pinned, so the launch reverts if the terms change before it lands.
+- **Portfolio**: claimable escrow balance, the launches you created with their pending fees, and your holdings.
+- **How it works**: the lifecycle, the fee split, the live terms and the verified contract addresses.
+
+Run it locally:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+The contract addresses and ABIs live in `web/src/generated/contracts.ts`. After changing the contracts or redeploying, regenerate it from the repository root:
+
+```bash
+npm run build && node web/scripts/sync-contracts.mjs
+```
+
+`NETWORK` selects the file in `deployments/` (Sepolia by default). `VITE_RPC_URL` overrides the public RPC endpoint; see `web/.env.example`.
+
+### Deploying to Vercel
+
+1. Import the repository in Vercel.
+2. Set **Root Directory** to `web`. The framework preset is Vite; `web/vercel.json` already sets the build command, the `dist` output and the single-page rewrite.
+3. Optionally add `VITE_RPC_URL` under Environment Variables with a private Sepolia endpoint. The public default works but is rate-limited.
+4. Deploy.
 
 ## Deployments
 
